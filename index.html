@@ -182,6 +182,26 @@
       saveGameState();
     }
     
+    // Toggle game and shot clocks
+    function toggleMasterGame() {
+      if (!appState.game) return;
+      if (appState.gameRunning || appState.shotClockRunning) {
+        appState.gameRunning = false;
+        appState.shotClockRunning = false;
+        stopMasterTimer();
+        toast('Game paused', 'info', 1500);
+      } else {
+        appState.gameRunning = true;
+        if (appState.game.settings.shotClockDuration > 0 && appState.game.gameState.shotClock > 0) {
+          appState.shotClockRunning = true;
+        }
+        startMasterTimer();
+        toast('Game started!', 'success', 1500);
+      }
+      updateMasterStartButton();
+      saveGameState();
+    }
+    
     // Update Score Logic
     function updateScore(team, points) {
       if (!appState.game) return;
