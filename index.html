@@ -4,877 +4,32 @@
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0"/>
   <title>Basketball Scoreboard Pro</title>
-  
-  <!-- Firebase SDKs -->
-  <script type="module">
-    import { initializeApp } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-app.js";
-    import { getAuth, signInAnonymously, signInWithCustomToken, onAuthStateChanged, createUserWithEmailAndPassword, signInWithEmailAndPassword } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-auth.js";
-    import { getFirestore, doc, setDoc, getDoc, onSnapshot, updateDoc, collection, query, where, getDocs, deleteDoc } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-firestore.js";
-    
-    // Global variables provided by the Canvas environment
-    const appId = typeof __app_id !== 'undefined' ? __app_id : 'default-app-id';
-    const firebaseConfig = JSON.parse(typeof __firebase_config !== 'undefined' ? __firebase_config : '{}');
-    const initialAuthToken = typeof __initial_auth_token !== 'undefined' ? __initial_auth_token : null;
-    
-    // Global Firebase instances
-    let app, db, auth, userId;
-    
-    // Game state management
-    const appState = {
-      view: 'landing',
-      isHost: false,
-      gameCode: null,
-      game: null,
-      gameRunning: false,
-      shotClockRunning: false,
-      selectedPlayer: null,
-      actionHistory: [],
-      clockEditing: false,
-      timers: { masterTimer: null }
-    };
-    
-    // UI shortcuts
-    const $ = (id) => document.getElementById(id);
-    const $$ = (sel) => document.querySelectorAll(sel);
-    
-    // Helper functions
-    function generateGameCode() {
-      return Math.floor(100000 + Math.random() * 900000).toString();
-    }
-    
-    function pad2(n) {
-      return n.toString().padStart(2, '0');
-    }
-    
-    function formatTime(m, s) {
-      return `${pad2(m)}:${pad2(s)}`;
-    }
-    
-    function toast(message, type = 'info', duration = 2000) {
-      const c = $('toastContainer');
-      if (!c) return;
-      const el = document.createElement('div');
-      const size = message.length > 50 || type === 'error' ? 'large' :
-                   message.length > 30 || type === 'warning' ? 'medium' : 'small';
-      el.className = `toast ${type} ${size}`;
-      el.textContent = message;
-      c.appendChild(el);
-      setTimeout(() => {
-        el.style.opacity = '0';
-        el.style.transform = 'translateX(100%)';
-        setTimeout(() => el.remove(), 300);
-      }, duration);
-    }
-    
-    async function copyToClipboard(text) {
-      try {
-        await navigator.clipboard.writeText(text);
-        toast('Game code copied!', 'success', 1500);
-      } catch (err) {
-        // Fallback for older browsers
-        const ta = document.createElement('textarea');
-        ta.value = text;
-        ta.style.position = 'fixed';
-        ta.style.left = '-9999px';
-        document.body.appendChild(ta);
-        ta.select();
-        try {
-          document.execCommand('copy');
-          toast('Game code copied!', 'success', 1500);
-        } catch {
-          toast('Copy failed - copy manually', 'warning', 3000);
-        }
-        ta.remove();
-      }
-    }
-    
-    // View Management
-    function showView(view) {
-      const ids = ['landing', 'config', 'setup', 'control', 'viewer'];
-      ids.forEach(v => {
-        const el = $(`${v}-view`);
-        if (el) {
-          el.classList.add('hidden');
-        }
-      });
-      const targetEl = $(`${view}-view`);
-      if (targetEl) {
-        targetEl.classList.remove('hidden');
-      }
-      appState.view = view;
-    }
-    
-    // Player Stats Initialization
-    function createPlayerStats() {
-      return {
-        points: 0,
-        ftm: 0, // Free Throws Made
-        fta: 0, // Free Throws Attempted
-        fgm: 0, // Field Goals Made (2-pointers)
-        fga: 0, // Field Goals Attempted (2-pointers)
-        tpm: 0, // 3-Pointers Made
-        tpa: 0, // 3-Pointers Attempted
-        rebounds: { off: 0, def: 0 },
-        assists: 0,
-        steals: 0,
-        blocks: 0,
-        turnovers: 0,
-        fouls: 0,
-      };
-    }
-    
-    // Player Scoring Logic
-    function handlePlayerStatChange(stat, value = 1) {
-      if (!appState.game || !appState.selectedPlayer) return;
-    
-      const game = appState.game;
-      const team = game.gameState.teamA.players.find(p => p.id === appState.selectedPlayer) ? 'teamA' : 'teamB';
-      const player = game.gameState[team].players.find(p => p.id === appState.selectedPlayer);
-      if (!player) return;
-    
-      switch (stat) {
-        case 'ftm':
-          player.stats.ftm += value;
-          player.stats.fta += value;
-          player.stats.points += value;
-          break;
-        case 'fgm':
-          player.stats.fgm += value;
-          player.stats.fga += value;
-          player.stats.points += value * 2;
-          break;
-        case 'tpm':
-          player.stats.tpm += value;
-          player.stats.tpa += value;
-          player.stats.points += value * 3;
-          break;
-        case 'fga': // Missed 2-pointer
-          player.stats.fga += value;
-          break;
-        case 'tpa': // Missed 3-pointer
-          player.stats.tpa += value;
-          break;
-        case 'rebounds_off':
-          player.stats.rebounds.off += value;
-          break;
-        case 'rebounds_def':
-          player.stats.rebounds.def += value;
-          break;
-        case 'assists':
-          player.stats.assists += value;
-          break;
-        case 'steals':
-          player.stats.steals += value;
-          break;
-        case 'blocks':
-          player.stats.blocks += value;
-          break;
-        case 'turnovers':
-          player.stats.turnovers += value;
-          break;
-        case 'fouls':
-          player.stats.fouls += value;
-          break;
-        default:
-          break;
-      }
-    
-      saveGameState();
-    }
-    
-    // Toggle game and shot clocks
-    function toggleMasterGame() {
-      if (!appState.game) return;
-      if (appState.gameRunning || appState.shotClockRunning) {
-        appState.gameRunning = false;
-        appState.shotClockRunning = false;
-        stopMasterTimer();
-        toast('Game paused', 'info', 1500);
-      } else {
-        appState.gameRunning = true;
-        if (appState.game.settings.shotClockDuration > 0 && appState.game.gameState.shotClock > 0) {
-          appState.shotClockRunning = true;
-        }
-        startMasterTimer();
-        toast('Game started!', 'success', 1500);
-      }
-      updateMasterStartButton();
-      saveGameState();
-    }
-    
-    // Update Score Logic
-    function updateScore(team, points) {
-      if (!appState.game) return;
-      const game = appState.game;
-      game.gameState[team].score += points;
-      saveGameState();
-    }
-    
-    // Game Clock Logic
-    function handleShotClockViolation() {
-      playViolation();
-      toast('SHOT CLOCK VIOLATION!', 'error', 3000);
-      
-      const g = appState.game;
-      if (g) {
-        appState.shotClockRunning = false;
-        const cur = g.gameState.possession;
-        g.gameState.possession = cur === 'teamA' ? 'teamB' : 'teamA';
-        g.gameState.shotClock = 0;
-        removeShotClockWarning();
-        saveGameState();
-      }
-    }
-    
-    function startMasterTimer() {
-      stopMasterTimer();
-      appState.timers.masterTimer = setInterval(() => {
-        const g = appState.game;
-        if (!g) return;
-        
-        let changed = false;
-        
-        // Game clock
-        if (appState.gameRunning) {
-          const t = g.gameState.gameTime;
-          if (t.seconds > 0) {
-            t.seconds--; changed = true;
-          } else if (t.minutes > 0) {
-            t.minutes--; t.seconds = 59; changed = true;
-          } else {
-            appState.gameRunning = false;
-            appState.shotClockRunning = false;
-            toast('Period ended!', 'warning', 3000);
-            changed = true;
-          }
-        }
-        
-        // Shot clock
-        if (appState.shotClockRunning && g.settings.shotClockDuration > 0) {
-          if (g.gameState.shotClock > 0) {
-            g.gameState.shotClock--; changed = true;
-            if (g.gameState.shotClock <= 5) addShotClockWarning();
-          } else {
-            handleShotClockViolation();
-            changed = true;
-          }
-        }
-        
-        if (changed) {
-          saveGameState();
-        }
-      }, 1000);
-    }
-    
-    function stopMasterTimer() {
-      if (appState.timers.masterTimer) {
-        clearInterval(appState.timers.masterTimer);
-        appState.timers.masterTimer = null;
-      }
-    }
-    
-    function playViolation() {
-      const buzzer = $('buzzerSound');
-      if (buzzer) {
-        buzzer.currentTime = 0;
-        buzzer.play().catch(()=>{});
-      }
-      const alert = $('shotClockViolation');
-      if (alert) {
-        alert.classList.remove('hidden');
-        setTimeout(() => alert.classList.add('hidden'), 2000);
-      }
-    }
-    
-    // UI Updates
-    function addShotClockWarning() {
-      $('shotClockDisplay')?.classList.add('warning');
-      $('viewerShotClock')?.classList.add('warning');
-    }
-    
-    function removeShotClockWarning() {
-      $('shotClockDisplay')?.classList.remove('warning');
-      $('viewerShotClock')?.classList.remove('warning');
-    }
-    
-    function updateMasterStartButton() {
-      const btn = $('startGameBtn');
-      if (!btn) return;
-      if (appState.gameRunning || appState.shotClockRunning) {
-        btn.textContent = 'PAUSE GAME';
-        btn.className = 'btn btn--primary master-start-btn pause';
-      } else {
-        btn.textContent = 'START GAME';
-        btn.className = 'btn btn--primary master-start-btn resume';
-      }
-    }
-    
-    function updateControlDisplay() {
-      if (!appState.game) return;
-      const game = appState.game;
-      const gameState = game.gameState;
-    
-      $('controlGameCode').textContent = game.gameCode;
-      $('controlGameName').textContent = game.settings.gameName || 'Basketball Game';
-      $('teamANameHdr').textContent = game.settings.teamAName;
-      $('teamBNameHdr').textContent = game.settings.teamBName;
-      $('teamAScore').textContent = gameState.teamA.score;
-      $('teamBScore').textContent = gameState.teamB.score;
-      $('periodDisplay').textContent = gameState.period;
-      $('clockDisplay').textContent = formatTime(gameState.gameTime.minutes, gameState.gameTime.seconds);
-    
-      const teamAColor = game.settings.teamAColor;
-      const teamBColor = game.settings.teamBColor;
-      $('teamANameHdr').style.background = `linear-gradient(to right, ${teamAColor}, transparent)`;
-      $('teamBNameHdr').style.background = `linear-gradient(to left, ${teamBColor}, transparent)`;
-    
-      const teamACol = $('teamACol');
-      const teamBCol = $('teamBCol');
-      if (gameState.possession === 'teamA') {
-          teamACol.style.border = `3px solid ${teamAColor}`;
-          teamBCol.style.border = 'none';
-      } else if (gameState.possession === 'teamB') {
-          teamACol.style.border = 'none';
-          teamBCol.style.border = `3px solid ${teamBColor}`;
-      } else {
-          teamACol.style.border = 'none';
-          teamBCol.style.border = 'none';
-      }
-    
-      // Shot clock
-      const shotClockSection = $('shotClockSection');
-      if (game.settings.shotClockDuration > 0) {
-        shotClockSection.classList.remove('hidden');
-        $('shotClockDisplay').textContent = gameState.shotClock;
-      } else {
-        shotClockSection.classList.add('hidden');
-      }
-      
-      updateMasterStartButton();
-      updatePlayerStatsUI();
-    }
-    
-    function updateSpectatorView() {
-      if (!appState.game) return;
-      const game = appState.game;
-      const gameState = game.gameState;
-    
-      $('viewerGameName').textContent = game.settings.gameName || 'Basketball Game';
-      $('viewerTeamAName').textContent = game.settings.teamAName;
-      $('viewerTeamBName').textContent = game.settings.teamBName;
-      $('viewerTeamAScore').textContent = gameState.teamA.score;
-      $('viewerTeamBScore').textContent = gameState.teamB.score;
-      $('viewerClock').textContent = formatTime(gameState.gameTime.minutes, gameState.gameTime.seconds);
-      $('viewerPeriod').textContent = gameState.period;
-    
-      // Shot clock
-      const viewerShotClockEl = $('viewerShotClock');
-      if (game.settings.shotClockDuration > 0) {
-        viewerShotClockEl.classList.remove('hidden');
-        viewerShotClockEl.textContent = gameState.shotClock;
-      } else {
-        viewerShotClockEl.classList.add('hidden');
-      }
-      
-      const possessionText = `Possession: ${gameState.possession === 'teamA' ? game.settings.teamAName : game.settings.teamBName}`;
-      $('viewerPossession').textContent = possessionText;
-    
-      // Update possession colors
-      const viewerTeamA = document.querySelector('.viewer-team:first-of-type');
-      const viewerTeamB = document.querySelector('.viewer-team:last-of-type');
-      if (gameState.possession === 'teamA') {
-          viewerTeamA.style.border = `3px solid ${game.settings.teamAColor}`;
-          viewerTeamB.style.border = 'none';
-      } else if (gameState.possession === 'teamB') {
-          viewerTeamB.style.border = `3px solid ${game.settings.teamBColor}`;
-          viewerTeamA.style.border = 'none';
-      } else {
-          viewerTeamA.style.border = 'none';
-          viewerTeamB.style.border = 'none';
-      }
-    }
-    
-    function updatePlayerStatsUI() {
-        if (appState.game?.settings.gameType !== 'full') {
-            $('statsSection').classList.add('hidden');
-            return;
-        }
-    
-        $('statsSection').classList.remove('hidden');
-        const statTeam = $('statTeamSelect').value;
-        const players = appState.game.gameState[statTeam].players;
-        const grid = $('playerScoringGrid');
-        grid.innerHTML = '';
-    
-        players.forEach(player => {
-            const isSelected = appState.selectedPlayer === player.id;
-            const card = document.createElement('div');
-            card.className = `player-score-card ${isSelected ? 'selected' : ''}`;
-            card.dataset.playerId = player.id;
-    
-            // Calculate shooting percentages
-            const fg_pct = player.stats.fga > 0 ? ((player.stats.fgm / player.stats.fga) * 100).toFixed(1) : 0;
-            const tp_pct = player.stats.tpa > 0 ? ((player.stats.tpm / player.stats.tpa) * 100).toFixed(1) : 0;
-            const ft_pct = player.stats.fta > 0 ? ((player.stats.ftm / player.stats.fta) * 100).toFixed(1) : 0;
-    
-            card.innerHTML = `
-                <div class="player-info">
-                    <span class="player-number">${player.number}</span>
-                    <span class="player-name">${player.name}</span>
-                </div>
-                <div class="player-stats">
-                    <strong>PTS: ${player.stats.points}</strong> | FT: ${player.stats.ftm}/${player.stats.fta} (${ft_pct}%) | FG: ${player.stats.fgm}/${player.stats.fga} (${fg_pct}%) | 3PT: ${player.stats.tpm}/${player.stats.tpa} (${tp_pct}%)
-                </div>
-                <div class="player-scoring-buttons">
-                    <button class="btn btn--secondary btn--score-1" data-stat="ftm">FTM</button>
-                    <button class="btn btn--secondary btn--score-2" data-stat="fgm">2PM</button>
-                    <button class="btn btn--secondary btn--score-3" data-stat="tpm">3PM</button>
-                    <button class="btn btn--outline btn--miss-2" data-stat="fga">Miss 2</button>
-                    <button class="btn btn--outline btn--miss-3" data-stat="tpa">Miss 3</button>
-                </div>
-            `;
-            grid.appendChild(card);
-    
-            // Add click listener for selecting player and adding points
-            card.addEventListener('click', (e) => {
-                // Handle button clicks
-                if (e.target.tagName === 'BUTTON') {
-                    e.stopPropagation();
-                    const stat = e.target.dataset.stat;
-                    appState.selectedPlayer = player.id;
-                    handlePlayerStatChange(stat);
-                    return;
-                }
-    
-                // Handle player card selection
-                if (appState.selectedPlayer === player.id) {
-                    appState.selectedPlayer = null;
-                } else {
-                    appState.selectedPlayer = player.id;
-                }
-                updatePlayerStatsUI();
-            });
-        });
-    }
-    
-    // Firebase Handlers
-    async function setupFirebase() {
-        if (!firebaseConfig.apiKey) {
-            console.error("Firebase config is missing. App will not function correctly.");
-            return;
-        }
-        
-        try {
-            app = initializeApp(firebaseConfig);
-            db = getFirestore(app);
-            auth = getAuth(app);
-            
-            // Sign in with the provided custom token or anonymously
-            if (initialAuthToken) {
-              await signInWithCustomToken(auth, initialAuthToken);
-            } else {
-              await signInAnonymously(auth);
-            }
-
-            // Listen for auth state changes
-            onAuthStateChanged(auth, (user) => {
-              if (user) {
-                userId = user.uid;
-                toast(`Signed in as user: ${userId.substring(0, 8)}`, 'success');
-              } else {
-                toast("Signed out", 'warning');
-                userId = null;
-              }
-            });
-        } catch (error) {
-            console.error("Error setting up Firebase:", error);
-            toast("Firebase setup failed", 'error');
-        }
-    }
-    
-    async function saveGameState() {
-      if (!appState.game || !db) return;
-      try {
-        const gameRef = doc(db, 'artifacts', appId, 'public', 'data', 'games', appState.gameCode);
-        await setDoc(gameRef, { game: appState.game, hostId: userId });
-        console.log("Game state saved successfully.");
-      } catch (e) {
-        console.error("Error saving game state: ", e);
-        toast("Failed to save game state.", 'error');
-      }
-    }
-    
-    async function createGame(gameConfig) {
-      if (!db || !userId) {
-        toast('Authentication failed, cannot create game.', 'error');
-        return;
-      }
-      
-      appState.gameCode = generateGameCode();
-      const newGame = {
-        gameCode: appState.gameCode,
-        settings: gameConfig,
-        gameState: {
-          teamA: { score: 0, players: gameConfig.gameType === 'full' ? [] : null },
-          teamB: { score: 0, players: gameConfig.gameType === 'full' ? [] : null },
-          period: 1,
-          gameTime: { minutes: gameConfig.periodDuration, seconds: 0 },
-          shotClock: gameConfig.shotClockDuration,
-          possession: 'teamA',
-          fouls: { teamA: 0, teamB: 0 }
-        }
-      };
-      appState.game = newGame;
-      appState.isHost = true;
-      
-      await saveGameState();
-      
-      toast(`Game created with code: ${appState.gameCode}`, 'success');
-      
-      const gameRef = doc(db, 'artifacts', appId, 'public', 'data', 'games', appState.gameCode);
-      onSnapshot(gameRef, (doc) => {
-        if (doc.exists() && doc.data().game) {
-            appState.game = doc.data().game;
-            // Update UI based on the new state
-            if (appState.view === 'control') {
-                updateControlDisplay();
-            }
-            if (appState.view === 'viewer') {
-                updateSpectatorView();
-            }
-        }
-      });
-    }
-    
-    async function joinGame(gameCode) {
-        if (!db) return;
-        
-        const gameRef = doc(db, 'artifacts', appId, 'public', 'data', 'games', gameCode);
-        const gameDoc = await getDoc(gameRef);
-        
-        if (!gameDoc.exists()) {
-            toast('Game code not found.', 'error');
-            return;
-        }
-        
-        appState.gameCode = gameCode;
-        appState.isHost = false;
-        appState.game = gameDoc.data().game;
-        showView('viewer');
-        
-        toast(`Joined game ${gameCode}`, 'success');
-        
-        // Listen for real-time updates
-        onSnapshot(gameRef, (doc) => {
-            if (doc.exists() && doc.data().game) {
-                appState.game = doc.data().game;
-                updateSpectatorView();
-            }
-        });
-    }
-    
-    // Event Handlers
-    function initEventListeners() {
-      // Landing page
-      $('watchGameBtn').addEventListener('click', () => {
-        const gameCode = $('watchCodeInput').value;
-        joinGame(gameCode);
-      });
-      $('watchCodeInput').addEventListener('input', (e) => {
-        const code = e.target.value.trim();
-        $('watchGameBtn').disabled = code.length !== 6;
-      });
-      $('createGameBtn').addEventListener('click', () => {
-        // Here you would add host password validation
-        const password = $('hostPasswordInput').value;
-        if (password.length < 4) {
-          toast('Password must be at least 4 characters.', 'warning');
-          return;
-        }
-        
-        // This is a placeholder for real auth
-        // For now, we just proceed
-        appState.isHost = true;
-        showView('config');
-        $('configGameCode').textContent = 'Generating...';
-        
-        // Generate and display code on config view
-        const newCode = generateGameCode();
-        appState.gameCode = newCode;
-        $('configGameCode').textContent = newCode;
-        
-      });
-      $('quickGameBtn').addEventListener('click', () => {
-        const quickGameConfig = {
-          gameName: 'Friendly Match',
-          periodDuration: 12,
-          shotClockDuration: 24,
-          teamAName: 'Home',
-          teamBName: 'Away',
-          teamAColor: '#FF6B35',
-          teamBColor: '#1B263B',
-          gameType: 'friendly',
-        };
-        createGame(quickGameConfig).then(() => {
-          showView('control');
-        });
-      });
-      
-      // Config View
-      $('copyConfigCode').addEventListener('click', () => copyToClipboard(appState.gameCode));
-      $('backToLandingFromConfig').addEventListener('click', () => showView('landing'));
-      $('shotClockSelect').addEventListener('change', (e) => {
-        $('customShotClockGroup').classList.toggle('hidden', e.target.value !== 'custom');
-      });
-      $('proceedToSetup').addEventListener('click', () => {
-        const gameConfig = {
-          gameName: $('gameNameInput').value || 'Basketball Game',
-          periodDuration: parseInt($('periodDurationSelect').value),
-          shotClockDuration: $('shotClockSelect').value === 'custom' ? parseInt($('customShotClock').value) : parseInt($('shotClockSelect').value),
-          teamAName: $('teamAName').value || 'Team A',
-          teamBName: $('teamBName').value || 'Team B',
-          teamAColor: $('teamAColor').value,
-          teamBColor: $('teamBColor').value,
-          gameType: $$('input[name="gameType"]:checked')[0].value,
-        };
-        createGame(gameConfig).then(() => {
-          if (appState.game.settings.gameType === 'full') {
-            showView('setup');
-            $('setupGameCode').textContent = appState.gameCode;
-            $('teamASetupTitle').textContent = appState.game.settings.teamAName;
-            $('teamBSetupTitle').textContent = appState.game.settings.teamBName;
-          } else {
-            showView('control');
-          }
-        });
-      });
-      
-      // Setup View
-      $('copySetupCode').addEventListener('click', () => copyToClipboard(appState.gameCode));
-      $('backToConfig').addEventListener('click', () => showView('config'));
-      $('skipRosterSetup').addEventListener('click', () => showView('control'));
-      $('startGame').addEventListener('click', () => showView('control'));
-      
-      $('addTeamAPlayer').addEventListener('click', () => addPlayer('teamA'));
-      $('addTeamBPlayer').addEventListener('click', () => addPlayer('teamB'));
-      
-      function addPlayer(team) {
-        const numberInput = $(`${team}PlayerNumber`);
-        const nameInput = $(`${team}PlayerName`);
-        const rosterEl = $(`${team}Roster`);
-        const countEl = $(`${team}Count`);
-        
-        const playerNumber = numberInput.value;
-        const playerName = nameInput.value.trim();
-        
-        if (!playerNumber || !playerName) {
-          toast('Please enter both number and name.', 'warning');
-          return;
-        }
-        
-        const newPlayer = {
-          id: `player-${Date.now()}`,
-          number: parseInt(playerNumber),
-          name: playerName,
-          stats: createPlayerStats()
-        };
-        
-        appState.game.gameState[team].players.push(newPlayer);
-        saveGameState();
-        
-        const playerItem = document.createElement('div');
-        playerItem.className = 'roster-item';
-        playerItem.innerHTML = `
-          <div class="roster-info">
-            <span class="roster-number">${newPlayer.number}</span>
-            <div class="roster-details">
-              <span class="roster-name">${newPlayer.name}</span>
-            </div>
-          </div>
-          <button class="remove-player" data-player-id="${newPlayer.id}">Remove</button>
-        `;
-        rosterEl.appendChild(playerItem);
-        countEl.textContent = appState.game.gameState[team].players.length;
-        
-        numberInput.value = '';
-        nameInput.value = '';
-      }
-      
-      // Add a single listener for both rosters to handle removal
-      $$('.roster-list').forEach(list => {
-          list.addEventListener('click', (e) => {
-              if (e.target.classList.contains('remove-player')) {
-                  const playerId = e.target.dataset.playerId;
-                  const team = list.id === 'teamARoster' ? 'teamA' : 'teamB';
-                  appState.game.gameState[team].players = appState.game.gameState[team].players.filter(p => p.id !== playerId);
-                  saveGameState();
-                  e.target.closest('.roster-item').remove();
-                  $(`${team}Count`).textContent = appState.game.gameState[team].players.length;
-              }
-          });
-      });
-      
-      // Control View
-      $('copyControlCode').addEventListener('click', () => copyToClipboard(appState.gameCode));
-      $('goToViewer').addEventListener('click', () => {
-          window.open(window.location.href, '_blank');
-      });
-      $('startGameBtn').addEventListener('click', toggleMasterGame);
-      $('resetAllClocksBtn').addEventListener('click', resetAllClocks);
-      
-      $('teamAPlus1').addEventListener('click', () => updateScore('teamA', 1));
-      $('teamAPlus2').addEventListener('click', () => updateScore('teamA', 2));
-      $('teamAPlus3').addEventListener('click', () => updateScore('teamA', 3));
-      $('teamAMinus1').addEventListener('click', () => updateScore('teamA', -1));
-      $('teamBPlus1').addEventListener('click', () => updateScore('teamB', 1));
-      $('teamBPlus2').addEventListener('click', () => updateScore('teamB', 2));
-      $('teamBPlus3').addEventListener('click', () => updateScore('teamB', 3));
-      $('teamBMinus1').addEventListener('click', () => updateScore('teamB', -1));
-      
-      // Clock and Period controls
-      $('editClockBtn').addEventListener('click', () => {
-        appState.clockEditing = true;
-        $('editMinutes').value = appState.game.gameState.gameTime.minutes;
-        $('editSeconds').value = appState.game.gameState.gameTime.seconds;
-        $('editClockModal').classList.remove('hidden');
-      });
-      $('nextPeriodBtn').addEventListener('click', () => {
-          if (!appState.game) return;
-          appState.game.gameState.period++;
-          resetAllClocks();
-          saveGameState();
-      });
-      $('prevPeriodBtn').addEventListener('click', () => {
-          if (!appState.game || appState.game.gameState.period <= 1) return;
-          appState.game.gameState.period--;
-          resetAllClocks();
-          saveGameState();
-      });
-      
-      // Shot clock controls
-      $('startShotClockBtn').addEventListener('click', () => {
-          appState.shotClockRunning = true;
-          startMasterTimer();
-          saveGameState();
-          toast('Shot clock started', 'info');
-      });
-      $('resetShot14Btn').addEventListener('click', () => {
-          if (!appState.game) return;
-          appState.game.gameState.shotClock = 14;
-          appState.shotClockRunning = true;
-          removeShotClockWarning();
-          saveGameState();
-          toast('Shot clock reset to 14', 'info');
-      });
-      $('resetShot24Btn').addEventListener('click', () => {
-          if (!appState.game) return;
-          appState.game.gameState.shotClock = 24;
-          appState.shotClockRunning = true;
-          removeShotClockWarning();
-          saveGameState();
-          toast('Shot clock reset to 24', 'info');
-      });
-      $('editShotClockBtn').addEventListener('click', () => {
-        appState.clockEditing = true;
-        $('editShotClockSeconds').value = appState.game.gameState.shotClock;
-        $('editShotClockModal').classList.remove('hidden');
-      });
-      
-      // Possession controls
-      $('possessionTeamA').addEventListener('click', () => {
-          if (!appState.game) return;
-          appState.game.gameState.possession = 'teamA';
-          saveGameState();
-      });
-      $('possessionTeamB').addEventListener('click', () => {
-          if (!appState.game) return;
-          appState.game.gameState.possession = 'teamB';
-          saveGameState();
-      });
-      
-      // Player Stats controls
-      $('statTeamSelect').addEventListener('change', updatePlayerStatsUI);
-      
-      // Modals
-      $('cancelClockEdit').addEventListener('click', () => $('editClockModal').classList.add('hidden'));
-      $('saveClockEdit').addEventListener('click', () => {
-          if (!appState.game) return;
-          const minutes = parseInt($('editMinutes').value);
-          const seconds = parseInt($('editSeconds').value);
-          
-          if (!isNaN(minutes) && !isNaN(seconds)) {
-            appState.game.gameState.gameTime.minutes = minutes;
-            appState.game.gameState.gameTime.seconds = seconds;
-            saveGameState();
-            toast('Game clock updated', 'success');
-          }
-          $('editClockModal').classList.add('hidden');
-          appState.clockEditing = false;
-      });
-      $('cancelShotClockEdit').addEventListener('click', () => $('editShotClockModal').classList.add('hidden'));
-      $('saveShotClockEdit').addEventListener('click', () => {
-          if (!appState.game) return;
-          const seconds = parseInt($('editShotClockSeconds').value);
-          if (!isNaN(seconds)) {
-            appState.game.gameState.shotClock = seconds;
-            saveGameState();
-            toast('Shot clock updated', 'success');
-          }
-          $('editShotClockModal').classList.add('hidden');
-          appState.clockEditing = false;
-      });
-
-      // Spacebar functionality
-      window.addEventListener('keydown', (e) => {
-        // Only toggle if the spacebar is pressed and we're not focused on an input field
-        if (e.code === 'Space' && e.target.tagName !== 'INPUT' && e.target.tagName !== 'SELECT' && e.target.tagName !== 'TEXTAREA') {
-          e.preventDefault();
-          toggleMasterGame();
-        }
-      });
-    }
-    
-    // Main execution
-    window.onload = async () => {
-      await setupFirebase();
-      initEventListeners();
-      // Initially show landing page
-      showView('landing');
-      console.log('App Initialized');
-    };
-  </script>
-  
   <style>
-    /* =======================================================
-    INLINE STYLES - BASKETBALL SCOREBOARD PRO
-    These styles are a combination of the original `style.css`
-    and new additions for improved functionality and aesthetics.
-    ======================================================= 
-    */
+    /* All CSS from style.css is now embedded here */
     :root {
       /* Primitive Color Tokens */
-      --color-white: #ffffff;
-      --color-black: #000000;
-      --color-cream-50: #fcfcf9;
-      --color-cream-100: #fffefd;
-      --color-gray-200: #f5f5f5;
-      --color-gray-300: #a7a9a9;
-      --color-gray-400: #777c7c;
-      --color-slate-500: #626c71;
-      --color-brown-600: #5e5240;
-      --color-charcoal-700: #1f2121;
-      --color-charcoal-800: #262828;
-      --color-slate-900: #13343b;
-      --color-teal-300: #32b8c6;
-      --color-teal-400: #2da6b2;
-      --color-teal-500: #21808d;
-      --color-teal-600: #1d7480;
-      --color-teal-700: #1a6873;
-      --color-teal-800: #2996a1;
-      --color-red-400: #ff5459;
-      --color-red-500: #c0152f;
-      --color-orange-400: #e68161;
-      --color-orange-500: #a84b2f;
+      --color-white: rgba(255, 255, 255, 1);
+      --color-black: rgba(0, 0, 0, 1);
+      --color-cream-50: rgba(252, 252, 249, 1);
+      --color-cream-100: rgba(255, 255, 253, 1);
+      --color-gray-200: rgba(245, 245, 245, 1);
+      --color-gray-300: rgba(167, 169, 169, 1);
+      --color-gray-400: rgba(119, 124, 124, 1);
+      --color-slate-500: rgba(98, 108, 113, 1);
+      --color-brown-600: rgba(94, 82, 64, 1);
+      --color-charcoal-700: rgba(31, 33, 33, 1);
+      --color-charcoal-800: rgba(38, 40, 40, 1);
+      --color-slate-900: rgba(19, 52, 59, 1);
+      --color-teal-300: rgba(50, 184, 198, 1);
+      --color-teal-400: rgba(45, 166, 178, 1);
+      --color-teal-500: rgba(33, 128, 141, 1);
+      --color-teal-600: rgba(29, 116, 128, 1);
+      --color-teal-700: rgba(26, 104, 115, 1);
+      --color-teal-800: rgba(41, 150, 161, 1);
+      --color-red-400: rgba(255, 84, 89, 1);
+      --color-red-500: rgba(192, 21, 47, 1);
+      --color-orange-400: rgba(230, 129, 97, 1);
+      --color-orange-500: rgba(168, 75, 47, 1);
 
       /* RGB versions for opacity control */
       --color-brown-600-rgb: 94, 82, 64;
@@ -887,14 +42,14 @@
       --color-orange-400-rgb: 230, 129, 97;
 
       /* Background color tokens (Light Mode) */
-      --color-bg-1: rgba(59, 130, 246, 0.08);
-      --color-bg-2: rgba(245, 158, 11, 0.08);
-      --color-bg-3: rgba(34, 197, 94, 0.08);
-      --color-bg-4: rgba(239, 68, 68, 0.08);
-      --color-bg-5: rgba(147, 51, 234, 0.08);
-      --color-bg-6: rgba(249, 115, 22, 0.08);
-      --color-bg-7: rgba(236, 72, 153, 0.08);
-      --color-bg-8: rgba(6, 182, 212, 0.08);
+      --color-bg-1: rgba(59, 130, 246, 0.08); /* Light blue */
+      --color-bg-2: rgba(245, 158, 11, 0.08); /* Light yellow */
+      --color-bg-3: rgba(34, 197, 94, 0.08); /* Light green */
+      --color-bg-4: rgba(239, 68, 68, 0.08); /* Light red */
+      --color-bg-5: rgba(147, 51, 234, 0.08); /* Light purple */
+      --color-bg-6: rgba(249, 115, 22, 0.08); /* Light orange */
+      --color-bg-7: rgba(236, 72, 153, 0.08); /* Light pink */
+      --color-bg-8: rgba(6, 182, 212, 0.08); /* Light cyan */
 
       /* Semantic Color Tokens (Light Mode) */
       --color-background: var(--color-cream-50);
@@ -917,20 +72,26 @@
       --color-info: var(--color-slate-500);
       --color-focus-ring: rgba(var(--color-teal-500-rgb), 0.4);
       --color-select-caret: rgba(var(--color-slate-900-rgb), 0.8);
-      --color-success-rgb: 33, 128, 141;
-      --color-error-rgb: 192, 21, 47;
-      --color-warning-rgb: 168, 75, 47;
-      --color-info-rgb: 98, 108, 113;
 
       /* Common style patterns */
       --focus-ring: 0 0 0 3px var(--color-focus-ring);
       --focus-outline: 2px solid var(--color-primary);
       --status-bg-opacity: 0.15;
       --status-border-opacity: 0.25;
+      --select-caret-light: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='16' height='16' viewBox='0 0 24 24' fill='none' stroke='%23134252' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpolyline points='6 9 12 15 18 9'%3E%3C/polyline%3E%3C/svg%3E");
+      --select-caret-dark: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='16' height='16' viewBox='0 0 24 24' fill='none' stroke='%23f5f5f5' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpolyline points='6 9 12 15 18 9'%3E%3C/polyline%3E%3C/svg%3E");
+
+      /* RGB versions for opacity control */
+      --color-success-rgb: 33, 128, 141;
+      --color-error-rgb: 192, 21, 47;
+      --color-warning-rgb: 168, 75, 47;
+      --color-info-rgb: 98, 108, 113;
 
       /* Typography */
-      --font-family-base: "Inter", -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
-      --font-family-mono: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+      --font-family-base: "FKGroteskNeue", "Geist", "Inter", -apple-system,
+        BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+      --font-family-mono: "Berkeley Mono", ui-monospace, SFMono-Regular, Menlo,
+        Monaco, Consolas, monospace;
       --font-size-xs: 11px;
       --font-size-sm: 12px;
       --font-size-base: 14px;
@@ -976,6 +137,8 @@
         0 2px 4px -1px rgba(0, 0, 0, 0.02);
       --shadow-lg: 0 10px 15px -3px rgba(0, 0, 0, 0.04),
         0 4px 6px -2px rgba(0, 0, 0, 0.02);
+      --shadow-inset-sm: inset 0 1px 0 rgba(255, 255, 255, 0.15),
+        inset 0 -1px 0 rgba(0, 0, 0, 0.03);
 
       /* Animation */
       --duration-fast: 150ms;
@@ -987,6 +150,159 @@
       --container-md: 768px;
       --container-lg: 1024px;
       --container-xl: 1280px;
+    }
+
+    /* Dark mode colors */
+    @media (prefers-color-scheme: dark) {
+      :root {
+        /* RGB versions for opacity control (Dark Mode) */
+        --color-gray-400-rgb: 119, 124, 124;
+        --color-teal-300-rgb: 50, 184, 198;
+        --color-gray-300-rgb: 167, 169, 169;
+        --color-gray-200-rgb: 245, 245, 245;
+
+        /* Background color tokens (Dark Mode) */
+        --color-bg-1: rgba(29, 78, 216, 0.15); /* Dark blue */
+        --color-bg-2: rgba(180, 83, 9, 0.15); /* Dark yellow */
+        --color-bg-3: rgba(21, 128, 61, 0.15); /* Dark green */
+        --color-bg-4: rgba(185, 28, 28, 0.15); /* Dark red */
+        --color-bg-5: rgba(107, 33, 168, 0.15); /* Dark purple */
+        --color-bg-6: rgba(194, 65, 12, 0.15); /* Dark orange */
+        --color-bg-7: rgba(190, 24, 93, 0.15); /* Dark pink */
+        --color-bg-8: rgba(8, 145, 178, 0.15); /* Dark cyan */
+        
+        /* Semantic Color Tokens (Dark Mode) */
+        --color-background: var(--color-charcoal-700);
+        --color-surface: var(--color-charcoal-800);
+        --color-text: var(--color-gray-200);
+        --color-text-secondary: rgba(var(--color-gray-300-rgb), 0.7);
+        --color-primary: var(--color-teal-300);
+        --color-primary-hover: var(--color-teal-400);
+        --color-primary-active: var(--color-teal-800);
+        --color-secondary: rgba(var(--color-gray-400-rgb), 0.15);
+        --color-secondary-hover: rgba(var(--color-gray-400-rgb), 0.25);
+        --color-secondary-active: rgba(var(--color-gray-400-rgb), 0.3);
+        --color-border: rgba(var(--color-gray-400-rgb), 0.3);
+        --color-error: var(--color-red-400);
+        --color-success: var(--color-teal-300);
+        --color-warning: var(--color-orange-400);
+        --color-info: var(--color-gray-300);
+        --color-focus-ring: rgba(var(--color-teal-300-rgb), 0.4);
+        --color-btn-primary-text: var(--color-slate-900);
+        --color-card-border: rgba(var(--color-gray-400-rgb), 0.2);
+        --color-card-border-inner: rgba(var(--color-gray-400-rgb), 0.15);
+        --shadow-inset-sm: inset 0 1px 0 rgba(255, 255, 255, 0.1),
+          inset 0 -1px 0 rgba(0, 0, 0, 0.15);
+        --button-border-secondary: rgba(var(--color-gray-400-rgb), 0.2);
+        --color-border-secondary: rgba(var(--color-gray-400-rgb), 0.2);
+        --color-select-caret: rgba(var(--color-gray-200-rgb), 0.8);
+
+        /* Common style patterns - updated for dark mode */
+        --focus-ring: 0 0 0 3px var(--color-focus-ring);
+        --focus-outline: 2px solid var(--color-primary);
+        --status-bg-opacity: 0.15;
+        --status-border-opacity: 0.25;
+        --select-caret-light: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='16' height='16' viewBox='0 0 24 24' fill='none' stroke='%23134252' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpolyline points='6 9 12 15 18 9'%3E%3C/polyline%3E%3C/svg%3E");
+        --select-caret-dark: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='16' height='16' viewBox='0 0 24 24' fill='none' stroke='%23f5f5f5' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpolyline points='6 9 12 15 18 9'%3E%3C/polyline%3E%3C/svg%3E");
+
+        /* RGB versions for dark mode */
+        --color-success-rgb: var(--color-teal-300-rgb);
+        --color-error-rgb: var(--color-red-400-rgb);
+        --color-warning-rgb: var(--color-orange-400-rgb);
+        --color-info-rgb: var(--color-gray-300-rgb);
+      }
+    }
+
+    /* Data attribute for manual theme switching */
+    [data-color-scheme="dark"] {
+      /* RGB versions for opacity control (dark mode) */
+      --color-gray-400-rgb: 119, 124, 124;
+      --color-teal-300-rgb: 50, 184, 198;
+      --color-gray-300-rgb: 167, 169, 169;
+      --color-gray-200-rgb: 245, 245, 245;
+
+      /* Colorful background palette - Dark Mode */
+      --color-bg-1: rgba(29, 78, 216, 0.15); /* Dark blue */
+      --color-bg-2: rgba(180, 83, 9, 0.15); /* Dark yellow */
+      --color-bg-3: rgba(21, 128, 61, 0.15); /* Dark green */
+      --color-bg-4: rgba(185, 28, 28, 0.15); /* Dark red */
+      --color-bg-5: rgba(107, 33, 168, 0.15); /* Dark purple */
+      --color-bg-6: rgba(194, 65, 12, 0.15); /* Dark orange */
+      --color-bg-7: rgba(190, 24, 93, 0.15); /* Dark pink */
+      --color-bg-8: rgba(8, 145, 178, 0.15); /* Dark cyan */
+      
+      /* Semantic Color Tokens (Dark Mode) */
+      --color-background: var(--color-charcoal-700);
+      --color-surface: var(--color-charcoal-800);
+      --color-text: var(--color-gray-200);
+      --color-text-secondary: rgba(var(--color-gray-300-rgb), 0.7);
+      --color-primary: var(--color-teal-300);
+      --color-primary-hover: var(--color-teal-400);
+      --color-primary-active: var(--color-teal-800);
+      --color-secondary: rgba(var(--color-gray-400-rgb), 0.15);
+      --color-secondary-hover: rgba(var(--color-gray-400-rgb), 0.25);
+      --color-secondary-active: rgba(var(--color-gray-400-rgb), 0.3);
+      --color-border: rgba(var(--color-gray-400-rgb), 0.3);
+      --color-error: var(--color-red-400);
+      --color-success: var(--color-teal-300);
+      --color-warning: var(--color-orange-400);
+      --color-info: var(--color-gray-300);
+      --color-focus-ring: rgba(var(--color-teal-300-rgb), 0.4);
+      --color-btn-primary-text: var(--color-slate-900);
+      --color-card-border: rgba(var(--color-gray-400-rgb), 0.15);
+      --color-card-border-inner: rgba(var(--color-gray-400-rgb), 0.15);
+      --shadow-inset-sm: inset 0 1px 0 rgba(255, 255, 255, 0.1),
+        inset 0 -1px 0 rgba(0, 0, 0, 0.15);
+      --color-border-secondary: rgba(var(--color-gray-400-rgb), 0.2);
+      --color-select-caret: rgba(var(--color-gray-200-rgb), 0.8);
+
+      /* Common style patterns - updated for dark mode */
+      --focus-ring: 0 0 0 3px var(--color-focus-ring);
+      --focus-outline: 2px solid var(--color-primary);
+      --status-bg-opacity: 0.15;
+      --status-border-opacity: 0.25;
+      --select-caret-light: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='16' height='16' viewBox='0 0 24 24' fill='none' stroke='%23134252' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpolyline points='6 9 12 15 18 9'%3E%3C/polyline%3E%3C/svg%3E");
+      --select-caret-dark: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='16' height='16' viewBox='0 0 24 24' fill='none' stroke='%23f5f5f5' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpolyline points='6 9 12 15 18 9'%3E%3C/polyline%3E%3C/svg%3E");
+
+      /* RGB versions for dark mode */
+      --color-success-rgb: var(--color-teal-300-rgb);
+      --color-error-rgb: var(--color-red-400-rgb);
+      --color-warning-rgb: var(--color-orange-400-rgb);
+      --color-info-rgb: var(--color-gray-300-rgb);
+    }
+
+    [data-color-scheme="light"] {
+      /* RGB versions for opacity control (light mode) */
+      --color-brown-600-rgb: 94, 82, 64;
+      --color-teal-500-rgb: 33, 128, 141;
+      --color-slate-900-rgb: 19, 52, 59;
+      
+      /* Semantic Color Tokens (Light Mode) */
+      --color-background: var(--color-cream-50);
+      --color-surface: var(--color-cream-100);
+      --color-text: var(--color-slate-900);
+      --color-text-secondary: var(--color-slate-500);
+      --color-primary: var(--color-teal-500);
+      --color-primary-hover: var(--color-teal-600);
+      --color-primary-active: var(--color-teal-700);
+      --color-secondary: rgba(var(--color-brown-600-rgb), 0.12);
+      --color-secondary-hover: rgba(var(--color-brown-600-rgb), 0.2);
+      --color-secondary-active: rgba(var(--color-brown-600-rgb), 0.25);
+      --color-border: rgba(var(--color-brown-600-rgb), 0.2);
+      --color-btn-primary-text: var(--color-cream-50);
+      --color-card-border: rgba(var(--color-brown-600-rgb), 0.12);
+      --color-card-border-inner: rgba(var(--color-brown-600-rgb), 0.12);
+      --color-error: var(--color-red-500);
+      --color-success: var(--color-teal-500);
+      --color-warning: var(--color-orange-500);
+      --color-info: var(--color-slate-500);
+      --color-focus-ring: rgba(var(--color-teal-500-rgb), 0.4);
+
+      /* RGB versions for light mode */
+      --color-success-rgb: var(--color-teal-500-rgb);
+      --color-error-rgb: var(--color-red-500-rgb);
+      --color-warning-rgb: var(--color-orange-500-rgb);
+      --color-info-rgb: var(--color-slate-500-rgb);
     }
 
     /* Base styles */
@@ -1011,427 +327,1827 @@
       box-sizing: inherit;
     }
 
-    /* Utility Classes */
-    .hidden {
-      display: none !important;
+    /* Typography */
+    h1,
+    h2,
+    h3,
+    h4,
+    h5,
+    h6 {
+      margin: 0;
+      font-weight: var(--font-weight-semibold);
+      line-height: var(--line-height-tight);
+      color: var(--color-text);
+      letter-spacing: var(--letter-spacing-tight);
     }
-    
-    /* Layout */
-    .app-container {
-      min-height: 100vh;
-      background-color: var(--color-background);
+
+    h1 {
+      font-size: var(--font-size-4xl);
+    }
+    h2 {
+      font-size: var(--font-size-3xl);
+    }
+    h3 {
+      font-size: var(--font-size-2xl);
+    }
+    h4 {
+      font-size: var(--font-size-xl);
+    }
+    h5 {
+      font-size: var(--font-size-lg);
+    }
+    h6 {
+      font-size: var(--font-size-md);
+    }
+
+    p {
+      margin: 0 0 var(--space-16) 0;
+    }
+
+    a {
+      color: var(--color-primary);
+      text-decoration: none;
+      transition: color var(--duration-fast) var(--ease-standard);
+    }
+
+    a:hover {
+      color: var(--color-primary-hover);
+    }
+
+    code,
+    pre {
+      font-family: var(--font-family-mono);
+      font-size: calc(var(--font-size-base) * 0.95);
+      background-color: var(--color-secondary);
+      border-radius: var(--radius-sm);
+    }
+
+    code {
+      padding: var(--space-1) var(--space-4);
+    }
+
+    pre {
+      padding: var(--space-16);
+      margin: var(--space-16) 0;
+      overflow: auto;
+      border: 1px solid var(--color-border);
+    }
+
+    pre code {
+      background: none;
+      padding: 0;
+    }
+
+    /* Buttons */
+    .btn {
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      padding: var(--space-8) var(--space-16);
+      border-radius: var(--radius-base);
+      font-size: var(--font-size-base);
+      font-weight: 500;
+      line-height: 1.5;
+      cursor: pointer;
+      transition: all var(--duration-normal) var(--ease-standard);
+      border: none;
+      text-decoration: none;
       position: relative;
     }
-    
-    .view {
-      padding: var(--space-32) 0;
-      min-height: 100vh;
+
+    .btn:focus-visible {
+      outline: none;
+      box-shadow: var(--focus-ring);
     }
-    
-    .container {
+
+    .btn--primary {
+      background: var(--color-primary);
+      color: var(--color-btn-primary-text);
+    }
+
+    .btn--primary:hover {
+      background: var(--color-primary-hover);
+    }
+
+    .btn--primary:active {
+      background: var(--color-primary-active);
+    }
+
+    .btn--secondary {
+      background: var(--color-secondary);
+      color: var(--color-text);
+    }
+
+    .btn--secondary:hover {
+      background: var(--color-secondary-hover);
+    }
+
+    .btn--secondary:active {
+      background: var(--color-secondary-active);
+    }
+
+    .btn--outline {
+      background: transparent;
+      border: 1px solid var(--color-border);
+      color: var(--color-text);
+    }
+
+    .btn--outline:hover {
+      background: var(--color-secondary);
+    }
+
+    .btn--sm {
+      padding: var(--space-4) var(--space-12);
+      font-size: var(--font-size-sm);
+      border-radius: var(--radius-sm);
+    }
+
+    .btn--lg {
+      padding: var(--space-10) var(--space-20);
+      font-size: var(--font-size-lg);
+      border-radius: var(--radius-md);
+    }
+
+    .btn--full-width {
       width: 100%;
-      margin: 0 auto;
-      padding: 0 var(--space-16);
-      max-width: var(--container-lg);
     }
-    
-    /* Landing View */
-    .landing-header {
-      text-align: center;
-      margin-bottom: var(--space-32);
+
+    .btn:disabled {
+      opacity: 0.5;
+      cursor: not-allowed;
     }
-    
-    .main-title {
-      font-size: var(--font-size-4xl);
-      font-weight: var(--font-weight-bold);
-      margin: 0 auto var(--space-16) auto;
-    }
-    
-    .hero-subtitle {
-      font-size: var(--font-size-xl);
-      color: var(--color-text-secondary);
-      max-width: 600px;
-      margin: 0 auto var(--space-32) auto;
-    }
-    
-    .landing-cards {
-      display: grid;
-      grid-template-columns: repeat(auto-fit, minmax(300px, 1fr));
-      gap: var(--space-24);
-    }
-    
-    .landing-card {
-      text-align: center;
-    }
-    
-    .card__body {
-      padding: var(--space-24);
-    }
-    
+
     /* Form elements */
-    .form-group {
-      margin-bottom: var(--space-16);
+    .form-control {
+      display: block;
+      width: 100%;
+      padding: var(--space-8) var(--space-12);
+      font-size: var(--font-size-md);
+      line-height: 1.5;
+      color: var(--color-text);
+      background-color: var(--color-surface);
+      border: 1px solid var(--color-border);
+      border-radius: var(--radius-base);
+      transition: border-color var(--duration-fast) var(--ease-standard),
+        box-shadow var(--duration-fast) var(--ease-standard);
     }
-    
+
+    textarea.form-control {
+      font-family: var(--font-family-base);
+      font-size: var(--font-size-base);
+    }
+
+    select.form-control {
+      padding: var(--space-8) var(--space-12);
+      -webkit-appearance: none;
+      -moz-appearance: none;
+      appearance: none;
+      background-image: var(--select-caret-light);
+      background-repeat: no-repeat;
+      background-position: right var(--space-12) center;
+      background-size: 16px;
+      padding-right: var(--space-32);
+    }
+
+    /* Add a dark mode specific caret */
+    @media (prefers-color-scheme: dark) {
+      select.form-control {
+        background-image: var(--select-caret-dark);
+      }
+    }
+
+    /* Also handle data-color-scheme */
+    [data-color-scheme="dark"] select.form-control {
+      background-image: var(--select-caret-dark);
+    }
+
+    [data-color-scheme="light"] select.form-control {
+      background-image: var(--select-caret-light);
+    }
+
+    .form-control:focus {
+      border-color: var(--color-primary);
+      outline: var(--focus-outline);
+    }
+
     .form-label {
       display: block;
       margin-bottom: var(--space-8);
       font-weight: var(--font-weight-medium);
       font-size: var(--font-size-sm);
     }
-    
-    .form-control {
-      width: 100%;
-      padding: var(--space-12) var(--space-16);
-      border: 1px solid var(--color-border);
-      border-radius: var(--radius-base);
+
+    .form-group {
+      margin-bottom: var(--space-16);
+    }
+
+    /* Card component */
+    .card {
       background-color: var(--color-surface);
-      color: var(--color-text);
+      border-radius: var(--radius-lg);
+      border: 1px solid var(--color-card-border);
+      box-shadow: var(--shadow-sm);
+      overflow: hidden;
+      transition: box-shadow var(--duration-normal) var(--ease-standard);
     }
-    
-    .form-row {
-      display: grid;
-      grid-template-columns: 1fr;
-      gap: var(--space-16);
+
+    .card:hover {
+      box-shadow: var(--shadow-md);
     }
-    
+
+    .card__body {
+      padding: var(--space-16);
+    }
+
+    .card__header,
+    .card__footer {
+      padding: var(--space-16);
+      border-bottom: 1px solid var(--color-card-border-inner);
+    }
+
+    /* Status indicators - simplified with CSS variables */
+    .status {
+      display: inline-flex;
+      align-items: center;
+      padding: var(--space-6) var(--space-12);
+      border-radius: var(--radius-full);
+      font-weight: var(--font-weight-medium);
+      font-size: var(--font-size-sm);
+    }
+
+    .status--success {
+      background-color: rgba(
+        var(--color-success-rgb, 33, 128, 141),
+        var(--status-bg-opacity)
+      );
+      color: var(--color-success);
+      border: 1px solid
+        rgba(var(--color-success-rgb, 33, 128, 141), var(--status-border-opacity));
+    }
+
+    .status--error {
+      background-color: rgba(
+        var(--color-error-rgb, 192, 21, 47),
+        var(--status-bg-opacity)
+      );
+      color: var(--color-error);
+      border: 1px solid
+        rgba(var(--color-error-rgb, 192, 21, 47), var(--status-border-opacity));
+    }
+
+    .status--warning {
+      background-color: rgba(
+        var(--color-warning-rgb, 168, 75, 47),
+        var(--status-bg-opacity)
+      );
+      color: var(--color-warning);
+      border: 1px solid
+        rgba(var(--color-warning-rgb, 168, 75, 47), var(--status-border-opacity));
+    }
+
+    .status--info {
+      background-color: rgba(
+        var(--color-info-rgb, 98, 108, 113),
+        var(--status-bg-opacity)
+      );
+      color: var(--color-info);
+      border: 1px solid
+        rgba(var(--color-info-rgb, 98, 108, 113), var(--status-border-opacity));
+    }
+
+    /* Container layout */
+    .container {
+      width: 100%;
+      margin-right: auto;
+      margin-left: auto;
+      padding-right: var(--space-16);
+      padding-left: var(--space-16);
+    }
+
     @media (min-width: 640px) {
-      .form-row {
-        grid-template-columns: 1fr 1fr;
+      .container {
+        max-width: var(--container-sm);
       }
     }
-    
-    /* Buttons */
-    .btn {
-      padding: var(--space-12) var(--space-24);
+    @media (min-width: 768px) {
+      .container {
+        max-width: var(--container-md);
+      }
+    }
+    @media (min-width: 1024px) {
+      .container {
+        max-width: var(--container-lg);
+      }
+    }
+    @media (min-width: 1280px) {
+      .container {
+        max-width: var(--container-xl);
+      }
+    }
+
+    /* Utility classes */
+    .flex {
+      display: flex;
+    }
+    .flex-col {
+      flex-direction: column;
+    }
+    .items-center {
+      align-items: center;
+    }
+    .justify-center {
+      justify-content: center;
+    }
+    .justify-between {
+      justify-content: space-between;
+    }
+    .gap-4 {
+      gap: var(--space-4);
+    }
+    .gap-8 {
+      gap: var(--space-8);
+    }
+    .gap-16 {
+      gap: var(--space-16);
+    }
+
+    .m-0 {
+      margin: 0;
+    }
+    .mt-8 {
+      margin-top: var(--space-8);
+    }
+    .mb-8 {
+      margin-bottom: var(--space-8);
+    }
+    .mx-8 {
+      margin-left: var(--space-8);
+      margin-right: var(--space-8);
+    }
+    .my-8 {
+      margin-top: var(--space-8);
+      margin-bottom: var(--space-8);
+    }
+
+    .p-0 {
+      padding: 0;
+    }
+    .py-8 {
+      padding-top: var(--space-8);
+      padding-bottom: var(--space-8);
+    }
+    .px-8 {
+      padding-left: var(--space-8);
+      padding-right: var(--space-8);
+    }
+    .py-16 {
+      padding-top: var(--space-16);
+      padding-bottom: var(--space-16);
+    }
+    .px-16 {
+      padding-left: var(--space-16);
+      padding-right: var(--space-16);
+    }
+
+    .block {
+      display: block;
+    }
+    .hidden {
+      display: none;
+    }
+
+    /* Accessibility */
+    .sr-only {
+      position: absolute;
+      width: 1px;
+      height: 1px;
+      padding: 0;
+      margin: -1px;
+      overflow: hidden;
+      clip: rect(0, 0, 0, 0);
+      white-space: nowrap;
+      border-width: 0;
+    }
+
+    :focus-visible {
+      outline: var(--focus-outline);
+      outline-offset: 2px;
+    }
+
+    /* Dark mode specifics */
+    [data-color-scheme="dark"] .btn--outline {
+      border: 1px solid var(--color-border-secondary);
+    }
+
+    @font-face {
+      font-family: 'FKGroteskNeue';
+      src: url('https://r2cdn.perplexity.ai/fonts/FKGroteskNeue.woff2')
+        format('woff2');
+    }
+
+    /* END PERPLEXITY DESIGN SYSTEM */
+    /* Basketball Scoreboard Pro - Enhanced Professional Styles with All Requested Fixes */
+
+    /* ================== ENHANCED LANDING PAGE ALIGNMENT ================== */
+    .landing-header {
+      text-align: center;
+      margin-bottom: var(--space-32);
+      padding: var(--space-32) 0;
+    }
+
+    .main-title {
+      font-size: var(--font-size-4xl);
+      font-weight: var(--font-weight-bold);
+      margin: 0 auto var(--space-16) auto;
+      text-align: center;
+      background: linear-gradient(135deg, var(--color-primary) 0%, var(--color-teal-400) 100%);
+      -webkit-background-clip: text;
+      -webkit-text-fill-color: transparent;
+      background-clip: text;
+      max-width: 800px;
+      line-height: var(--line-height-tight);
+    }
+
+    .basketball-icon {
+      font-size: 4rem;
+      margin: 0 auto var(--space-24) auto;
+      color: var(--color-primary);
+      text-shadow: 0 4px 8px rgba(33, 128, 141, 0.3);
+      animation: basketballBounce 2s ease-in-out infinite;
+      display: block;
+      text-align: center;
+    }
+
+    @keyframes basketballBounce {
+      0%, 100% { transform: translateY(0px); }
+      50% { transform: translateY(-10px); }
+    }
+
+    .hero-subtitle {
+      font-size: var(--font-size-xl);
+      color: var(--color-text-secondary);
+      margin: 0 auto var(--space-32) auto;
+      text-align: center;
+      max-width: 600px;
+      line-height: var(--line-height-normal);
+    }
+
+    .landing-cards {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(320px, 1fr));
+      gap: var(--space-32);
+      max-width: 800px;
+      margin: 0 auto;
+    }
+
+    .landing-card {
+      text-align: center;
+      transition: all var(--duration-normal) var(--ease-standard);
+      background: linear-gradient(135deg, var(--color-surface) 0%, var(--color-bg-2) 100%);
+      border: 1px solid var(--color-card-border);
+      position: relative;
+      overflow: hidden;
+      box-shadow: var(--shadow-md);
+    }
+
+    .landing-card::before {
+      content: '';
+      position: absolute;
+      top: 0;
+      left: 0;
+      right: 0;
+      height: 4px;
+      background: linear-gradient(90deg, var(--color-primary) 0%, var(--color-teal-400) 100%);
+    }
+
+    .landing-card:hover {
+      transform: translateY(-6px);
+      box-shadow: 0 12px 40px rgba(33, 128, 141, 0.15);
+    }
+
+    .card-icon {
+      font-size: 3rem;
+      margin-bottom: var(--space-16);
+      filter: drop-shadow(0 4px 8px rgba(0, 0, 0, 0.1));
+      text-align: center;
+    }
+
+    /* ================== ENHANCED COLOR PICKER ================== */
+    .color-picker-group {
+      display: flex;
+      align-items: center;
+      gap: var(--space-12);
+    }
+
+    .color-input {
+      width: 60px;
+      height: 40px;
+      padding: 0;
+      border: 2px solid var(--color-border);
       border-radius: var(--radius-base);
-      font-weight: var(--font-weight-medium);
       cursor: pointer;
-      border: none;
-      transition: all var(--duration-fast) ease-in-out;
+      transition: all var(--duration-fast) var(--ease-standard);
     }
-    
-    .btn--primary {
-      background-color: var(--color-primary);
-      color: var(--color-white);
+
+    .color-input:hover {
+      border-color: var(--color-primary);
+      transform: scale(1.05);
     }
-    
-    .btn--secondary {
-      background-color: var(--color-secondary);
+
+    .color-preview {
+      width: 40px;
+      height: 40px;
+      border-radius: var(--radius-base);
+      border: 2px solid var(--color-border);
+      background: var(--color-bg-1);
+      transition: all var(--duration-fast) var(--ease-standard);
+    }
+
+    /* ================== GAME TYPE SELECTION ================== */
+    .game-type-selection {
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: var(--space-16);
+      margin-top: var(--space-16);
+    }
+
+    .game-type-option {
+      cursor: pointer;
+      position: relative;
+    }
+
+    .game-type-option input[type="radio"] {
+      position: absolute;
+      opacity: 0;
+      width: 0;
+      height: 0;
+    }
+
+    .game-type-card {
+      padding: var(--space-20);
+      border: 2px solid var(--color-border);
+      border-radius: var(--radius-lg);
+      background: linear-gradient(135deg, var(--color-bg-1) 0%, var(--color-bg-2) 100%);
+      transition: all var(--duration-normal) var(--ease-standard);
+      text-align: center;
+      height: 100%;
+    }
+
+    .game-type-option input[type="radio"]:checked + .game-type-card {
+      border-color: var(--color-primary);
+      background: linear-gradient(135deg, rgba(var(--color-teal-500-rgb), 0.1) 0%, rgba(var(--color-teal-500-rgb), 0.05) 100%);
+      box-shadow: 0 4px 16px rgba(33, 128, 141, 0.2);
+    }
+
+    .game-type-card:hover {
+      border-color: var(--color-primary);
+      transform: translateY(-3px);
+    }
+
+    .game-type-icon {
+      font-size: 2.5rem;
+      margin-bottom: var(--space-12);
+    }
+
+    .game-type-card h4 {
+      margin-bottom: var(--space-8);
       color: var(--color-text);
+      font-size: var(--font-size-lg);
     }
-    
-    .btn--outline {
-      background-color: transparent;
+
+    .game-type-card p {
+      margin: 0;
+      color: var(--color-text-secondary);
+      font-size: var(--font-size-sm);
+    }
+
+    /* ================== TOP SCORER DISPLAY ================== */
+    .top-scorer {
+      font-size: var(--font-size-sm);
+      font-weight: var(--font-weight-medium);
+      color: var(--color-text-secondary);
+      margin-bottom: var(--space-12);
+      padding: var(--space-6) var(--space-12);
+      background: linear-gradient(135deg, var(--color-bg-1) 0%, var(--color-bg-2) 100%);
+      border-radius: var(--radius-full);
       border: 1px solid var(--color-border);
-      color: var(--color-text);
+      min-height: 32px;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      text-align: center;
     }
-    
-    .btn:disabled {
-      opacity: 0.5;
-      cursor: not-allowed;
+
+    .viewer-top-scorer {
+      font-size: var(--font-size-lg);
+      font-weight: var(--font-weight-medium);
+      color: var(--color-text-secondary);
+      margin-top: var(--space-16);
+      padding: var(--space-12) var(--space-16);
+      background: linear-gradient(135deg, var(--color-bg-1) 0%, var(--color-bg-2) 100%);
+      border-radius: var(--radius-lg);
+      border: 2px solid var(--color-border);
+      text-align: center;
+      min-height: 48px;
+      display: flex;
+      align-items: center;
+      justify-content: center;
     }
-    
-    /* Config View */
+
+    /* ================== ENHANCED TOAST NOTIFICATIONS ================== */
+    .toast-container {
+      position: fixed;
+      top: var(--space-20);
+      right: var(--space-20);
+      z-index: 2000;
+      display: flex;
+      flex-direction: column;
+      gap: var(--space-8);
+      pointer-events: none;
+    }
+
+    .toast {
+      background: rgba(var(--color-success-rgb), 0.85);
+      backdrop-filter: blur(12px);
+      border-radius: var(--radius-base);
+      padding: var(--space-8) var(--space-12);
+      max-width: 240px;
+      min-width: 160px;
+      box-shadow: 0 4px 20px rgba(0, 0, 0, 0.15);
+      border: 1px solid rgba(255, 255, 255, 0.1);
+      color: var(--color-white);
+      font-weight: var(--font-weight-medium);
+      font-size: var(--font-size-sm);
+      line-height: 1.3;
+      pointer-events: auto;
+      transform: translateX(100%);
+      animation: slideInToast 0.3s ease-out forwards;
+      transition: opacity var(--duration-normal) var(--ease-standard);
+    }
+
+    .toast.small {
+      padding: var(--space-6) var(--space-10);
+      font-size: var(--font-size-xs);
+      max-width: 180px;
+    }
+
+    .toast.medium {
+      padding: var(--space-10) var(--space-16);
+      font-size: var(--font-size-sm);
+      max-width: 260px;
+    }
+
+    .toast.large {
+      padding: var(--space-12) var(--space-20);
+      font-size: var(--font-size-base);
+      max-width: 320px;
+    }
+
+    .toast.info {
+      background: rgba(var(--color-info-rgb), 0.85);
+    }
+
+    .toast.success {
+      background: rgba(var(--color-success-rgb), 0.85);
+    }
+
+    .toast.error {
+      background: rgba(var(--color-error-rgb), 0.85);
+    }
+
+    .toast.warning {
+      background: rgba(var(--color-warning-rgb), 0.85);
+    }
+
+    @keyframes slideInToast {
+      0% {
+        transform: translateX(100%);
+        opacity: 0;
+      }
+      100% {
+        transform: translateX(0);
+        opacity: 1;
+      }
+    }
+
+    /* ================== SHOT CLOCK VIOLATION ALERT ================== */
+    .violation-alert {
+      position: fixed;
+      top: 50%;
+      left: 50%;
+      transform: translate(-50%, -50%);
+      z-index: 3000;
+      background: linear-gradient(135deg, rgba(255, 84, 89, 0.95) 0%, rgba(192, 21, 47, 0.95) 100%);
+      backdrop-filter: blur(20px);
+      border-radius: var(--radius-lg);
+      padding: var(--space-32);
+      box-shadow: 0 20px 60px rgba(0, 0, 0, 0.4);
+      border: 3px solid var(--color-error);
+      animation: violationPulse 0.5s ease-in-out infinite alternate;
+    }
+
+    .violation-alert.hidden {
+      display: none;
+    }
+
+    .violation-content {
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      gap: var(--space-16);
+      color: var(--color-white);
+      text-align: center;
+    }
+
+    .violation-icon {
+      font-size: 4rem;
+      animation: violationShake 0.3s ease-in-out infinite;
+    }
+
+    .violation-text {
+      font-size: var(--font-size-3xl);
+      font-weight: var(--font-weight-bold);
+      letter-spacing: 2px;
+      text-shadow: 0 2px 8px rgba(0, 0, 0, 0.5);
+    }
+
+    @keyframes violationPulse {
+      0% { transform: translate(-50%, -50%) scale(1); }
+      100% { transform: translate(-50%, -50%) scale(1.05); }
+    }
+
+    @keyframes violationShake {
+      0%, 100% { transform: translateX(0); }
+      25% { transform: translateX(-5px); }
+      75% { transform: translateX(5px); }
+    }
+
+    /* ================== ENHANCED APP CONTAINER ================== */
+    .app-container {
+      min-height: 100vh;
+      background: linear-gradient(135deg, var(--color-background) 0%, var(--color-bg-1) 100%);
+      position: relative;
+      overflow-x: hidden;
+    }
+
+    .app-container::before {
+      content: '';
+      position: fixed;
+      top: 0;
+      left: 0;
+      right: 0;
+      bottom: 0;
+      background: radial-gradient(circle at 20% 50%, rgba(255, 107, 53, 0.1) 0%, transparent 50%),
+                  radial-gradient(circle at 80% 20%, rgba(27, 38, 59, 0.1) 0%, transparent 50%);
+      pointer-events: none;
+      z-index: -1;
+    }
+
+    .view {
+      padding: var(--space-32) 0;
+      min-height: 100vh;
+      position: relative;
+    }
+
+    .container-fluid {
+      width: 100%;
+      padding: 0 var(--space-24);
+      margin: 0 auto;
+    }
+
+    /* ================== ENHANCED SECTION HEADERS ================== */
     .section-header {
       display: flex;
       justify-content: space-between;
       align-items: flex-start;
       margin-bottom: var(--space-32);
       flex-wrap: wrap;
+      gap: var(--space-16);
+      background: linear-gradient(135deg, var(--color-surface) 0%, var(--color-bg-3) 100%);
+      padding: var(--space-24);
+      border-radius: var(--radius-lg);
+      border: 1px solid var(--color-card-border);
+      box-shadow: var(--shadow-md);
     }
-    
+
+    .section-header h2 {
+      margin-bottom: var(--space-8);
+      background: linear-gradient(135deg, var(--color-primary) 0%, var(--color-teal-400) 100%);
+      -webkit-background-clip: text;
+      -webkit-text-fill-color: transparent;
+      background-clip: text;
+    }
+
     .game-code-display {
       display: flex;
       align-items: center;
       gap: var(--space-12);
+      background: rgba(var(--color-teal-500-rgb), 0.1);
+      padding: var(--space-12) var(--space-16);
+      border-radius: var(--radius-full);
+      border: 1px solid rgba(var(--color-teal-500-rgb), 0.2);
     }
-    
+
+    /* ================== ENHANCED CONFIGURATION ================== */
     .config-grid {
       display: grid;
       grid-template-columns: 1fr;
       gap: var(--space-24);
+      margin-bottom: var(--space-32);
     }
-    
+
     @media (min-width: 768px) {
       .config-grid {
-        grid-template-columns: 1fr 1fr;
+        grid-template-columns: repeat(auto-fit, minmax(350px, 1fr));
       }
     }
-    
-    .card {
-      background-color: var(--color-surface);
-      border-radius: var(--radius-lg);
-      border: 1px solid var(--color-card-border);
-      box-shadow: var(--shadow-sm);
+
+    .config-grid .card {
+      background: linear-gradient(135deg, var(--color-surface) 0%, var(--color-bg-4) 100%);
+      border-left: 4px solid var(--color-primary);
+      box-shadow: var(--shadow-md);
     }
-    
-    .color-picker-group {
-      display: flex;
-      align-items: center;
-      gap: var(--space-12);
+
+    .form-row {
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: var(--space-16);
     }
-    
-    .color-input {
-      width: 48px;
-      height: 48px;
-      padding: 0;
-      border: none;
-      cursor: pointer;
-      background: none;
+
+    .form-group {
+      margin-bottom: var(--space-16);
     }
-    
-    .color-preview {
-      width: 48px;
-      height: 48px;
-      border-radius: var(--radius-sm);
-      border: 1px solid var(--color-border);
-    }
-    
-    /* Setup View */
+
+    /* ================== ENHANCED TEAM SETUP ================== */
     .setup-grid {
       display: grid;
       grid-template-columns: 1fr;
-      gap: var(--space-24);
+      gap: var(--space-32);
+      margin-bottom: var(--space-32);
     }
-    
+
     @media (min-width: 768px) {
       .setup-grid {
         grid-template-columns: 1fr 1fr;
       }
     }
-    
-    .roster-list {
-      max-height: 300px;
-      overflow-y: auto;
-      padding-top: var(--space-16);
+
+    .team-setup-card {
+      position: relative;
+      overflow: hidden;
+      box-shadow: var(--shadow-md);
     }
-    
+
+    .team-setup-card::before {
+      content: '';
+      position: absolute;
+      top: 0;
+      left: 0;
+      right: 0;
+      height: 4px;
+      background: linear-gradient(90deg, var(--color-primary) 0%, var(--color-teal-400) 100%);
+    }
+
     .roster-item {
       display: flex;
-      justify-content: space-between;
       align-items: center;
+      justify-content: space-between;
       padding: var(--space-12) var(--space-16);
-      background-color: var(--color-bg-1);
+      background: linear-gradient(135deg, var(--color-bg-1) 0%, var(--color-bg-2) 100%);
+      border: 1px solid var(--color-border);
       border-radius: var(--radius-base);
       margin-bottom: var(--space-8);
+      transition: all var(--duration-fast) var(--ease-standard);
     }
-    
+
+    .roster-item:hover {
+      background: linear-gradient(135deg, var(--color-bg-2) 0%, var(--color-bg-3) 100%);
+      border-color: var(--color-primary);
+      transform: translateX(4px);
+    }
+
     .roster-number {
       font-weight: var(--font-weight-bold);
-      margin-right: var(--space-12);
+      font-family: var(--font-family-mono);
+      background: linear-gradient(135deg, var(--color-primary) 0%, var(--color-teal-400) 100%);
+      color: var(--color-btn-primary-text);
+      padding: var(--space-6) var(--space-10);
+      border-radius: var(--radius-sm);
+      min-width: 44px;
+      text-align: center;
+      box-shadow: 0 2px 8px rgba(33, 128, 141, 0.3);
     }
-    
+
     .remove-player {
-      background-color: var(--color-red-500);
+      background: var(--color-error);
       color: var(--color-white);
       border: none;
-      padding: var(--space-4) var(--space-8);
       border-radius: var(--radius-sm);
+      padding: var(--space-4) var(--space-8);
       cursor: pointer;
+      font-size: var(--font-size-sm);
+      transition: all var(--duration-fast) var(--ease-standard);
     }
-    
-    /* Control View */
+
+    .remove-player:hover {
+      background: var(--color-red-400);
+      transform: scale(1.1);
+    }
+
+    .roster-info {
+      display: flex;
+      align-items: center;
+      gap: var(--space-12);
+    }
+
+    .roster-details {
+      display: flex;
+      flex-direction: column;
+    }
+
+    .roster-name {
+      font-weight: var(--font-weight-medium);
+      color: var(--color-text);
+    }
+
+    .roster-position {
+      font-size: var(--font-size-xs);
+      color: var(--color-text-secondary);
+    }
+
+    .roster-counter {
+      margin-top: var(--space-16);
+      text-align: center;
+      font-weight: var(--font-weight-medium);
+      color: var(--color-text-secondary);
+      padding: var(--space-8);
+      background: var(--color-bg-1);
+      border-radius: var(--radius-base);
+    }
+
+    /* ================== ENHANCED CONTROL PANEL ================== */
     .control-header {
       display: flex;
       justify-content: space-between;
       align-items: center;
-      padding-bottom: var(--space-24);
-      border-bottom: 1px solid var(--color-border);
+      padding: var(--space-20) var(--space-24);
+      background: linear-gradient(135deg, var(--color-surface) 0%, var(--color-bg-5) 100%);
+      border-bottom: 3px solid var(--color-primary);
       margin-bottom: var(--space-24);
       flex-wrap: wrap;
+      gap: var(--space-16);
+      box-shadow: var(--shadow-lg);
     }
-    
-    .control-actions {
-      display: flex;
-      gap: var(--space-12);
+
+    .control-grid {
+      display: grid;
+      grid-template-columns: 1fr;
+      gap: var(--space-24);
     }
-    
+
+    @media (min-width: 1024px) {
+      .control-grid {
+        grid-template-columns: 2fr 1fr;
+      }
+    }
+
+    /* ================== ENHANCED SCOREBOARD ================== */
     .scoreboard {
       display: grid;
       grid-template-columns: 1fr;
       gap: var(--space-24);
+      align-items: center;
       text-align: center;
+      margin-bottom: var(--space-32);
+      background: linear-gradient(135deg, var(--color-bg-1) 0%, var(--color-bg-2) 100%);
+      padding: var(--space-24);
+      border-radius: var(--radius-lg);
+      border: 2px solid var(--color-card-border);
+      box-shadow: var(--shadow-md);
     }
-    
+
     @media (min-width: 768px) {
       .scoreboard {
         grid-template-columns: 1fr auto 1fr;
         gap: var(--space-32);
       }
     }
-    
-    .team-score {
-      border-radius: var(--radius-lg);
-      padding: var(--space-24);
-      transition: all var(--duration-fast) ease-in-out;
+
+    .team-score h3 {
+      margin-bottom: var(--space-16);
+      background: linear-gradient(135deg, var(--color-primary) 0%, var(--color-teal-400) 100%);
+      -webkit-background-clip: text;
+      -webkit-text-fill-color: transparent;
+      background-clip: text;
+      font-size: var(--font-size-2xl);
     }
-    
+
     .score-display {
-      font-size: 5rem;
+      font-size: 4rem;
       font-weight: var(--font-weight-bold);
+      font-family: var(--font-family-mono);
+      background: linear-gradient(135deg, var(--color-text) 0%, var(--color-primary) 100%);
+      -webkit-background-clip: text;
+      -webkit-text-fill-color: transparent;
+      background-clip: text;
+      margin-bottom: var(--space-16);
+      line-height: 1;
+      text-shadow: 0 4px 8px rgba(0, 0, 0, 0.1);
     }
-    
+
     .score-controls {
       display: flex;
-      justify-content: center;
       gap: var(--space-8);
+      justify-content: center;
+      flex-wrap: wrap;
     }
-    
+
     .score-btn {
-      padding: var(--space-8) var(--space-16);
+      min-width: 50px;
+      font-weight: var(--font-weight-bold);
+      background: linear-gradient(135deg, var(--color-secondary) 0%, var(--color-bg-4) 100%);
+      border: 1px solid var(--color-border);
+      transition: all var(--duration-fast) var(--ease-standard);
     }
-    
+
+    .score-btn:hover {
+      background: linear-gradient(135deg, var(--color-primary) 0%, var(--color-teal-400) 100%);
+      color: var(--color-btn-primary-text);
+      transform: translateY(-2px);
+      box-shadow: 0 4px 12px rgba(33, 128, 141, 0.3);
+    }
+
+    /* ================== ENHANCED CLOCK SECTION ================== */
     .clock-section {
       display: flex;
       flex-direction: column;
       align-items: center;
       gap: var(--space-16);
+      background: linear-gradient(135deg, var(--color-bg-6) 0%, var(--color-bg-7) 100%);
+      padding: var(--space-24);
+      border-radius: var(--radius-lg);
+      border: 2px solid var(--color-primary);
+      box-shadow: 0 8px 32px rgba(33, 128, 141, 0.2);
+      order: -1;
     }
-    
+
+    @media (min-width: 768px) {
+      .clock-section {
+        order: 0;
+      }
+    }
+
     .clock-display {
       font-size: 3rem;
-      font-weight: var(--font-weight-bold);
       font-family: var(--font-family-mono);
-      background-color: var(--color-surface);
-      border: 2px solid var(--color-border);
-      border-radius: var(--radius-base);
+      font-weight: var(--font-weight-bold);
+      background: linear-gradient(135deg, var(--color-text) 0%, var(--color-primary) 100%);
+      -webkit-background-clip: text;
+      -webkit-text-fill-color: transparent;
+      background-clip: text;
+      border: 3px solid var(--color-primary);
+      border-radius: var(--radius-md);
       padding: var(--space-16) var(--space-24);
+      cursor: pointer;
+      transition: all var(--duration-fast) var(--ease-standard);
+      min-width: 160px;
+      text-align: center;
+      background-color: rgba(var(--color-teal-500-rgb), 0.05);
     }
-    
-    .shot-clock-display {
-      font-size: 2rem;
+
+    .clock-display:hover {
+      border-color: var(--color-teal-400);
+      background-color: rgba(var(--color-teal-500-rgb), 0.1);
+      transform: scale(1.02);
+    }
+
+    .period-display {
+      font-size: var(--font-size-lg);
       font-weight: var(--font-weight-bold);
-      font-family: var(--font-family-mono);
-      color: var(--color-warning);
-      background-color: var(--color-surface);
-      border: 2px solid var(--color-warning);
-      border-radius: var(--radius-base);
-      padding: var(--space-8) var(--space-16);
-      transition: all var(--duration-fast) ease-in-out;
+      color: var(--color-text);
+      margin-bottom: var(--space-8);
     }
-    
-    .shot-clock-display.warning {
-      animation: pulse 1s infinite alternate;
+
+    .master-clock-controls {
+      display: flex;
+      flex-direction: column;
+      gap: var(--space-12);
+      align-items: center;
     }
-    
-    @keyframes pulse {
-      from { transform: scale(1); }
-      to { transform: scale(1.05); border-color: var(--color-red-500); }
-    }
-    
-    .possession-controls {
+
+    .clock-control-row {
       display: flex;
       gap: var(--space-8);
+      flex-wrap: wrap;
+      justify-content: center;
     }
-    
-    .stats-section {
-      margin-top: var(--space-32);
+
+    .master-start-btn {
+      font-size: var(--font-size-lg);
+      font-weight: var(--font-weight-bold);
+      padding: var(--space-16) var(--space-32);
+      background: linear-gradient(135deg, var(--color-success) 0%, var(--color-teal-400) 100%);
+      color: var(--color-btn-primary-text);
+      border: none;
+      box-shadow: 0 6px 20px rgba(34, 197, 94, 0.3);
+      transition: all var(--duration-normal) var(--ease-standard);
     }
-    
-    .player-scoring-grid {
-      display: grid;
-      grid-template-columns: repeat(auto-fit, minmax(250px, 1fr));
-      gap: var(--space-16);
+
+    .master-start-btn:hover {
+      transform: translateY(-3px);
+      box-shadow: 0 8px 25px rgba(34, 197, 94, 0.4);
+    }
+
+    .master-start-btn.pause {
+      background: linear-gradient(135deg, var(--color-warning) 0%, var(--color-orange-400) 100%);
+    }
+
+    .master-start-btn.resume {
+      background: linear-gradient(135deg, var(--color-success) 0%, var(--color-teal-400) 100%);
+    }
+
+    .shot-clock-section {
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      gap: var(--space-12);
       margin-top: var(--space-16);
     }
-    
-    .player-score-card {
-      background-color: var(--color-surface);
-      border: 1px solid var(--color-card-border);
-      border-radius: var(--radius-base);
-      padding: var(--space-16);
-      transition: all var(--duration-fast) ease-in-out;
+
+    .shot-clock-section.hidden {
+      display: none;
+    }
+
+    .shot-clock-display {
+      font-size: 2rem;
+      font-family: var(--font-family-mono);
+      font-weight: var(--font-weight-bold);
+      background: linear-gradient(135deg, rgba(230, 129, 97, 0.1) 0%, rgba(230, 129, 97, 0.2) 100%);
+      border: 2px solid var(--color-warning);
+      border-radius: var(--radius-md);
+      padding: var(--space-12) var(--space-16);
+      color: var(--color-warning);
+      min-width: 80px;
+      text-align: center;
+      box-shadow: 0 4px 16px rgba(230, 129, 97, 0.2);
+      transition: all var(--duration-fast) var(--ease-standard);
       cursor: pointer;
     }
-    
-    .player-score-card:hover, .player-score-card.selected {
-      border-color: var(--color-primary);
-      box-shadow: var(--shadow-md);
+
+    .shot-clock-display:hover {
+      transform: scale(1.05);
     }
-    
-    .player-scoring-buttons {
+
+    .shot-clock-display.warning {
+      border-color: var(--color-error);
+      color: var(--color-error);
+      background: linear-gradient(135deg, rgba(255, 84, 89, 0.1) 0%, rgba(255, 84, 89, 0.2) 100%);
+      animation: shotClockWarning 1s ease-in-out infinite alternate;
+    }
+
+    @keyframes shotClockWarning {
+      0% { transform: scale(1); }
+      100% { transform: scale(1.1); }
+    }
+
+    .shot-clock-label {
+      font-size: var(--font-size-sm);
+      font-weight: var(--font-weight-medium);
+      color: var(--color-text-secondary);
+      text-align: center;
+    }
+
+    .shot-clock-actions {
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: var(--space-8);
+      justify-content: center;
+      min-width: 200px;
+    }
+
+    .shot-clock-actions .btn {
+      font-size: var(--font-size-xs);
+      padding: var(--space-6) var(--space-8);
+    }
+
+    /* ================== COMPREHENSIVE STATISTICS SECTION ================== */
+    .stats-section {
+      display: none;
+    }
+
+    .stats-section.show {
+      display: block;
+    }
+
+    .stats-header {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      margin-bottom: var(--space-16);
+      flex-wrap: wrap;
+      gap: var(--space-12);
+    }
+
+    .stats-controls {
       display: flex;
       gap: var(--space-8);
-      margin-top: var(--space-12);
+      flex-wrap: wrap;
     }
-    
-    /* Viewer View */
+
+    /* ================== ENHANCED PLAYER SCORING GRID ================== */
+    .player-scoring-grid {
+      display: grid;
+      grid-template-columns: repeat(auto-fill, minmax(280px, 1fr));
+      gap: var(--space-16);
+      margin-bottom: var(--space-24);
+      max-height: 400px;
+      overflow-y: auto;
+    }
+
+    .player-score-card {
+      background: linear-gradient(135deg, var(--color-bg-1) 0%, var(--color-bg-2) 100%);
+      border: 1px solid var(--color-border);
+      border-radius: var(--radius-base);
+      padding: var(--space-12);
+      transition: all var(--duration-fast) var(--ease-standard);
+    }
+
+    .player-score-card:hover {
+      border-color: var(--color-primary);
+      transform: translateY(-2px);
+      box-shadow: var(--shadow-md);
+    }
+
+    .player-info {
+      display: flex;
+      align-items: center;
+      gap: var(--space-12);
+      margin-bottom: var(--space-12);
+    }
+
+    .player-number {
+      font-weight: var(--font-weight-bold);
+      font-family: var(--font-family-mono);
+      background: linear-gradient(135deg, var(--color-primary) 0%, var(--color-teal-400) 100%);
+      color: var(--color-btn-primary-text);
+      padding: var(--space-6) var(--space-10);
+      border-radius: var(--radius-sm);
+      min-width: 40px;
+      text-align: center;
+      box-shadow: 0 2px 8px rgba(33, 128, 141, 0.2);
+    }
+
+    .player-name {
+      font-weight: var(--font-weight-medium);
+      color: var(--color-text);
+      flex: 1;
+    }
+
+    .player-stats {
+      font-size: var(--font-size-xs);
+      color: var(--color-text-secondary);
+      margin-bottom: var(--space-8);
+      line-height: 1.4;
+    }
+
+    .player-scoring-buttons {
+      display: flex;
+      gap: var(--space-6);
+      justify-content: center;
+    }
+
+    .player-scoring-buttons .btn {
+      min-width: 36px;
+      height: 32px;
+      font-weight: var(--font-weight-bold);
+      font-size: var(--font-size-xs);
+      padding: var(--space-4) var(--space-8);
+      border-radius: var(--radius-sm);
+      transition: all var(--duration-fast) var(--ease-standard);
+    }
+
+    .player-scoring-buttons .btn--score-1 {
+      background: linear-gradient(135deg, var(--color-info) 0%, var(--color-slate-500) 100%);
+      color: var(--color-white);
+      border: 1px solid var(--color-info);
+    }
+
+    .player-scoring-buttons .btn--score-2 {
+      background: linear-gradient(135deg, var(--color-success) 0%, var(--color-teal-400) 100%);
+      color: var(--color-btn-primary-text);
+      border: 1px solid var(--color-success);
+    }
+
+    .player-scoring-buttons .btn--score-3 {
+      background: linear-gradient(135deg, var(--color-warning) 0%, var(--color-orange-400) 100%);
+      color: var(--color-white);
+      border: 1px solid var(--color-warning);
+    }
+
+    .player-scoring-buttons .btn:hover {
+      transform: translateY(-2px);
+      box-shadow: 0 4px 12px rgba(0, 0, 0, 0.2);
+    }
+
+    /* ================== COMPREHENSIVE STATISTICS TABLE ================== */
+    .comprehensive-stats-section {
+      margin-top: var(--space-24);
+    }
+
+    .comprehensive-stats-section h5 {
+      margin-bottom: var(--space-16);
+      color: var(--color-text);
+      font-size: var(--font-size-lg);
+    }
+
+    .stats-table-container {
+      max-height: 300px;
+      overflow: auto;
+      border: 1px solid var(--color-border);
+      border-radius: var(--radius-base);
+      background: var(--color-surface);
+    }
+
+    .comprehensive-stats-table {
+      width: 100%;
+      border-collapse: collapse;
+      font-size: var(--font-size-xs);
+      table-layout: fixed;
+    }
+
+    .comprehensive-stats-table th {
+      background: linear-gradient(135deg, var(--color-primary) 0%, var(--color-teal-400) 100%);
+      color: var(--color-btn-primary-text);
+      font-weight: var(--font-weight-bold);
+      position: sticky;
+      top: 0;
+      z-index: 2;
+      padding: var(--space-8) var(--space-4);
+      text-align: center;
+      font-size: var(--font-size-xs);
+      white-space: nowrap;
+    }
+
+    .comprehensive-stats-table .sticky-col {
+      position: sticky;
+      left: 0;
+      z-index: 3;
+      background: linear-gradient(135deg, var(--color-primary) 0%, var(--color-teal-400) 100%);
+    }
+
+    .comprehensive-stats-table td {
+      padding: var(--space-6) var(--space-4);
+      text-align: center;
+      border-bottom: 1px solid var(--color-border);
+      font-family: var(--font-family-mono);
+      font-size: var(--font-size-xs);
+      white-space: nowrap;
+    }
+
+    .comprehensive-stats-table tr:hover {
+      background: linear-gradient(135deg, var(--color-bg-1) 0%, var(--color-bg-2) 100%);
+    }
+
+    /* Column widths */
+    .comprehensive-stats-table th:nth-child(1),
+    .comprehensive-stats-table td:nth-child(1) { width: 40px; }
+    .comprehensive-stats-table th:nth-child(2),
+    .comprehensive-stats-table td:nth-child(2) { width: 120px; text-align: left; }
+    .comprehensive-stats-table th:nth-child(n+3),
+    .comprehensive-stats-table td:nth-child(n+3) { width: 35px; }
+
+    /* ================== QUICK STATS ACTIONS ================== */
+    .quick-stats-actions {
+      margin-top: var(--space-24);
+      padding: var(--space-16);
+      background: var(--color-bg-1);
+      border-radius: var(--radius-base);
+      border: 1px solid var(--color-border);
+    }
+
+    .quick-stats-actions h5 {
+      margin-bottom: var(--space-12);
+      color: var(--color-text);
+    }
+
+    .quick-stat-grid {
+      display: grid;
+      grid-template-columns: 1fr;
+      gap: var(--space-12);
+    }
+
+    @media (min-width: 768px) {
+      .quick-stat-grid {
+        grid-template-columns: 200px 1fr;
+        align-items: center;
+      }
+    }
+
+    .stat-buttons {
+      display: flex;
+      gap: var(--space-6);
+      flex-wrap: wrap;
+    }
+
+    .stat-btn {
+      font-size: var(--font-size-xs);
+      padding: var(--space-6) var(--space-10);
+      min-width: 50px;
+      background: var(--color-secondary);
+      border: 1px solid var(--color-border);
+      transition: all var(--duration-fast) var(--ease-standard);
+    }
+
+    .stat-btn:hover {
+      background: var(--color-primary);
+      color: var(--color-btn-primary-text);
+      transform: translateY(-1px);
+    }
+
+    /* ================== ENHANCED SPECTATOR VIEW ================== */
     .viewer-scoreboard {
       display: grid;
       grid-template-columns: 1fr;
       gap: var(--space-24);
-      text-align: center;
+      align-items: center;
+      padding: var(--space-32);
+      background: linear-gradient(135deg, var(--color-surface) 0%, var(--color-bg-1) 100%);
+      border-radius: var(--radius-lg);
+      margin-bottom: var(--space-32);
+      border: 3px solid var(--color-primary);
+      box-shadow: 0 12px 48px rgba(33, 128, 141, 0.2);
     }
-    
+
     @media (min-width: 768px) {
       .viewer-scoreboard {
         grid-template-columns: 1fr auto 1fr;
         gap: var(--space-32);
       }
     }
-    
+
+    .viewer-team {
+      text-align: center;
+    }
+
+    .viewer-team h2 {
+      margin-bottom: var(--space-16);
+      font-size: var(--font-size-3xl);
+      background: linear-gradient(135deg, var(--color-primary) 0%, var(--color-teal-400) 100%);
+      -webkit-background-clip: text;
+      -webkit-text-fill-color: transparent;
+      background-clip: text;
+    }
+
     .viewer-score {
       font-size: 6rem;
       font-weight: var(--font-weight-bold);
+      font-family: var(--font-family-mono);
+      background: linear-gradient(135deg, var(--color-text) 0%, var(--color-primary) 100%);
+      -webkit-background-clip: text;
+      -webkit-text-fill-color: transparent;
+      background-clip: text;
+      line-height: 1;
+      text-shadow: 0 8px 16px rgba(0, 0, 0, 0.1);
     }
-    
-    /* Modals */
+
+    @media (max-width: 768px) {
+      .viewer-score {
+        font-size: 4rem;
+      }
+    }
+
+    .viewer-center {
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      gap: var(--space-16);
+      background: linear-gradient(135deg, var(--color-bg-6) 0%, var(--color-bg-7) 100%);
+      padding: var(--space-32);
+      border-radius: var(--radius-lg);
+      border: 2px solid var(--color-primary);
+      order: -1;
+    }
+
+    @media (min-width: 768px) {
+      .viewer-center {
+        order: 0;
+      }
+    }
+
+    .viewer-clock {
+      font-size: 4rem;
+      font-family: var(--font-family-mono);
+      font-weight: var(--font-weight-bold);
+      background: linear-gradient(135deg, var(--color-text) 0%, var(--color-primary) 100%);
+      -webkit-background-clip: text;
+      -webkit-text-fill-color: transparent;
+      background-clip: text;
+      border: 3px solid var(--color-primary);
+      border-radius: var(--radius-lg);
+      padding: var(--space-24) var(--space-32);
+      background-color: rgba(var(--color-teal-500-rgb), 0.05);
+    }
+
+    @media (max-width: 768px) {
+      .viewer-clock {
+        font-size: 2.5rem;
+        padding: var(--space-16) var(--space-20);
+      }
+    }
+
+    .viewer-period {
+      font-size: var(--font-size-xl);
+      font-weight: var(--font-weight-bold);
+      color: var(--color-text);
+    }
+
+    .viewer-shot-clock {
+      font-size: 2rem;
+      font-family: var(--font-family-mono);
+      font-weight: var(--font-weight-bold);
+      background: rgba(230, 129, 97, 0.1);
+      border: 2px solid var(--color-warning);
+      border-radius: var(--radius-base);
+      padding: var(--space-12) var(--space-16);
+      color: var(--color-warning);
+      box-shadow: 0 4px 16px rgba(230, 129, 97, 0.2);
+    }
+
+    .viewer-info {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      padding: var(--space-20);
+      background: linear-gradient(135deg, var(--color-bg-1) 0%, var(--color-bg-2) 100%);
+      border-radius: var(--radius-lg);
+      border: 1px solid var(--color-border);
+      flex-wrap: wrap;
+      gap: var(--space-16);
+    }
+
+    .game-name {
+      font-size: var(--font-size-xl);
+      font-weight: var(--font-weight-bold);
+      color: var(--color-text);
+    }
+
+    .possession-indicator {
+      display: flex;
+      align-items: center;
+      gap: var(--space-8);
+      font-weight: var(--font-weight-medium);
+    }
+
+    /* ================== ENHANCED ANIMATIONS ================== */
+    .score-animation {
+      position: fixed;
+      font-size: var(--font-size-2xl);
+      font-weight: var(--font-weight-bold);
+      pointer-events: none;
+      z-index: 1500;
+      animation: enhancedScoreFloat 1.5s ease-out forwards;
+      text-shadow: 0 2px 8px rgba(0, 0, 0, 0.3);
+    }
+
+    @keyframes enhancedScoreFloat {
+      0% {
+        opacity: 1;
+        transform: translateY(0) scale(1);
+      }
+      50% {
+        opacity: 1;
+        transform: translateY(-30px) scale(1.3);
+      }
+      100% {
+        opacity: 0;
+        transform: translateY(-60px) scale(0.8);
+      }
+    }
+
+    /* ================== LAYOUT & STRUCTURE ================== */
+    .section-actions {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      margin-top: var(--space-32);
+      flex-wrap: wrap;
+      gap: var(--space-16);
+      padding: var(--space-20);
+      background: linear-gradient(135deg, var(--color-bg-1) 0%, var(--color-bg-2) 100%);
+      border-radius: var(--radius-base);
+      border: 1px solid var(--color-card-border);
+    }
+
+    .control-actions {
+      display: flex;
+      gap: var(--space-12);
+      flex-wrap: wrap;
+    }
+
+    /* ================== ENHANCED FORM ELEMENTS ================== */
+    .form-control:focus {
+      border-color: var(--color-primary);
+      outline: var(--focus-outline);
+      box-shadow: 0 0 0 3px rgba(var(--color-teal-500-rgb), 0.1);
+    }
+
+    /* ================== VALIDATION STATES ================== */
+    .validation-message {
+      margin-top: var(--space-8);
+      padding: var(--space-8) var(--space-12);
+      border-radius: var(--radius-sm);
+      font-size: var(--font-size-sm);
+      text-align: center;
+      font-weight: var(--font-weight-medium);
+    }
+
+    .validation-message.success {
+      background: linear-gradient(135deg, rgba(var(--color-success-rgb), 0.1) 0%, rgba(var(--color-success-rgb), 0.15) 100%);
+      color: var(--color-success);
+      border: 1px solid rgba(var(--color-success-rgb), 0.3);
+    }
+
+    .validation-message.error {
+      background: linear-gradient(135deg, rgba(var(--color-error-rgb), 0.1) 0%, rgba(var(--color-error-rgb), 0.15) 100%);
+      color: var(--color-error);
+      border: 1px solid rgba(var(--color-error-rgb), 0.3);
+    }
+
+    /* ================== ENHANCED GAME INFO ================== */
+    .game-info-grid {
+      display: grid;
+      grid-template-columns: 1fr;
+      gap: var(--space-16);
+    }
+
+    @media (min-width: 768px) {
+      .game-info-grid {
+        grid-template-columns: 1fr auto 1fr;
+      }
+    }
+
+    .team-info {
+      display: flex;
+      flex-direction: column;
+      gap: var(--space-12);
+    }
+
+    .info-item {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      gap: var(--space-12);
+    }
+
+    .possession-controls {
+      display: flex;
+      gap: var(--space-8);
+      justify-content: center;
+    }
+
+    .possession-btn {
+      flex: 1;
+      transition: all var(--duration-fast) var(--ease-standard);
+      background: var(--color-secondary);
+    }
+
+    .possession-btn.active {
+      background: linear-gradient(135deg, var(--color-primary) 0%, var(--color-teal-400) 100%);
+      color: var(--color-btn-primary-text);
+      border-color: var(--color-primary);
+      box-shadow: 0 4px 16px rgba(33, 128, 141, 0.3);
+    }
+
+    .counter-controls {
+      display: flex;
+      align-items: center;
+      gap: var(--space-8);
+    }
+
+    .counter-controls span {
+      font-weight: var(--font-weight-bold);
+      font-family: var(--font-family-mono);
+      min-width: 30px;
+      text-align: center;
+      background: var(--color-bg-2);
+      padding: var(--space-4) var(--space-8);
+      border-radius: var(--radius-sm);
+    }
+
+    /* ================== ENHANCED MODALS ================== */
     .modal {
       position: fixed;
       top: 0;
       left: 0;
       width: 100%;
       height: 100%;
-      background-color: rgba(0,0,0,0.5);
+      background-color: rgba(0, 0, 0, 0.6);
+      backdrop-filter: blur(8px);
       display: flex;
       align-items: center;
       justify-content: center;
       z-index: 1000;
     }
-    
-    .modal-content {
-      background-color: var(--color-surface);
-      padding: var(--space-24);
-      border-radius: var(--radius-lg);
-      width: 90%;
-      max-width: 400px;
+
+    .modal.hidden {
+      display: none;
     }
-    
+
+    .modal-content {
+      background: linear-gradient(135deg, var(--color-surface) 0%, var(--color-bg-1) 100%);
+      border-radius: var(--radius-lg);
+      padding: var(--space-32);
+      max-width: 400px;
+      width: 90%;
+      box-shadow: 0 20px 60px rgba(0, 0, 0, 0.3);
+      border: 1px solid var(--color-card-border);
+    }
+
     .modal-actions {
-      margin-top: var(--space-16);
       display: flex;
       justify-content: flex-end;
-      gap: var(--space-8);
+      gap: var(--space-12);
+      margin-top: var(--space-20);
     }
-    
-    /* Toasts */
-    .toast-container {
-      position: fixed;
-      top: var(--space-24);
-      right: var(--space-24);
-      z-index: 2000;
-      display: flex;
-      flex-direction: column;
-      gap: var(--space-8);
+
+    /* ================== RESPONSIVE ENHANCEMENTS ================== */
+    @media (max-width: 768px) {
+      .form-row {
+        grid-template-columns: 1fr;
+      }
+      
+      .control-header {
+        text-align: center;
+      }
+      
+      .section-header {
+        text-align: center;
+      }
+      
+      .player-scoring-grid {
+        grid-template-columns: 1fr;
+      }
+      
+      .comprehensive-stats-table {
+        font-size: 10px;
+      }
+      
+      .comprehensive-stats-table th,
+      .comprehensive-stats-table td {
+        padding: var(--space-4) var(--space-2);
+      }
     }
-    
-    .toast {
-      padding: var(--space-12) var(--space-16);
-      border-radius: var(--radius-base);
-      box-shadow: var(--shadow-md);
-      color: var(--color-white);
-      font-weight: var(--font-weight-medium);
-      transform: translateX(120%);
-      transition: all 0.3s ease-out;
+
+    /* ================== ACCESSIBILITY ENHANCEMENTS ================== */
+    @media (prefers-reduced-motion: reduce) {
+      * {
+        animation-duration: 0.01ms !important;
+        animation-iteration-count: 1 !important;
+        transition-duration: 0.01ms !important;
+      }
+      
+      .basketball-icon {
+        animation: none;
+      }
+      
+      .score-animation {
+        animation: none;
+        opacity: 0;
+      }
     }
-    
-    .toast.success { background-color: var(--color-success); }
-    .toast.info { background-color: var(--color-info); }
-    .toast.warning { background-color: var(--color-warning); }
-    .toast.error { background-color: var(--color-error); }
-    .toast.large { max-width: 300px; }
-    
+
+    /* ================== PRINT STYLES ================== */
+    @media print {
+      .control-header,
+      .section-actions,
+      .master-clock-controls,
+      .shot-clock-actions,
+      .score-controls {
+        display: none;
+      }
+    }
+
+    /* ================== SCORE ANIMATION PREVIEW ================== */
+
+    /* This class will be temporarily added to the score display to trigger the animation */
+    .score-update-animation {
+      animation: score-pop 0.6s ease-in-out;
+    }
+
+    /* This defines the animation steps: grow, glow, and return to normal */
+    @keyframes score-pop {
+      0% {
+        transform: scale(1);
+      }
+      50% {
+        transform: scale(1.25);
+        color: var(--color-success);
+        text-shadow: 0 0 15px rgba(var(--color-success-rgb), 0.7);
+      }
+      100% {
+        transform: scale(1);
+      }
+    }
   </style>
 </head>
 <body>
@@ -1440,29 +2156,34 @@
   </audio>
 
   <div class="app-container">
-    <!-- Landing View - The starting page where users can choose to host or watch a game. -->
+    <!-- Landing View -->
     <section id="landing-view" class="view container">
       <header class="landing-header">
         <div class="basketball-icon">🏀</div>
         <h1 class="main-title">Basketball Scoreboard Pro</h1>
         <p class="hero-subtitle">Create a game, run clocks, update scores, and track player stats in real time.</p>
       </header>
+
       <div class="landing-cards">
         <article class="card landing-card">
           <div class="card__body">
-            <h3>Watch a Game</h3>
+            <div class="card-icon">👁️</div>
+            <h3>Enter a game code to spectate</h3>
             <div class="form-group">
               <label class="form-label" for="watchCodeInput">Game Code</label>
               <input id="watchCodeInput" class="form-control" placeholder="6-digit code" maxlength="6"/>
+              <div id="codeValidationMessage" class="validation-message hidden"></div>
             </div>
             <div class="section-actions">
               <button id="watchGameBtn" class="btn btn--primary" disabled>Watch Game</button>
             </div>
           </div>
         </article>
+
         <article class="card landing-card">
           <div class="card__body">
-            <h3>Host a New Game</h3>
+            <div class="card-icon">🧑‍✈️</div>
+            <h3>Create and manage a new game</h3>
             <div class="form-group">
               <label class="form-label" for="hostPasswordInput">Host Password</label>
               <input id="hostPasswordInput" class="form-control" type="password" placeholder="Min 4 characters"/>
@@ -1472,10 +2193,12 @@
             </div>
           </div>
         </article>
+
         <article class="card landing-card">
           <div class="card__body">
-            <h3>Start a Quick Game</h3>
-            <p>Creates a friendly game with instant controls and no player rosters.</p>
+            <div class="card-icon">⚡</div>
+            <h3>Quick game without player rosters</h3>
+            <p class="top-scorer">Creates a friendly game with instant controls.</p>
             <div class="section-actions">
               <button id="quickGameBtn" class="btn btn--secondary">Start Quick Game</button>
             </div>
@@ -1484,7 +2207,7 @@
       </div>
     </section>
 
-    <!-- Config View - The page for setting up game rules and team details. -->
+    <!-- Config View -->
     <section id="config-view" class="view container hidden">
       <div class="section-header">
         <div>
@@ -1497,6 +2220,7 @@
         </div>
         <button id="backToLandingFromConfig" class="btn btn--outline">Back</button>
       </div>
+
       <div class="config-grid">
         <div class="card">
           <div class="card__body">
@@ -1529,6 +2253,7 @@
             </div>
           </div>
         </div>
+
         <div class="card">
           <div class="card__body">
             <h4>Game Type</h4>
@@ -1536,6 +2261,7 @@
               <label class="game-type-option">
                 <input type="radio" name="gameType" value="friendly" checked/>
                 <div class="game-type-card">
+                  <div class="game-type-icon">🤝</div>
                   <h4>Friendly</h4>
                   <p>No rosters required</p>
                 </div>
@@ -1543,6 +2269,7 @@
               <label class="game-type-option">
                 <input type="radio" name="gameType" value="full"/>
                 <div class="game-type-card">
+                  <div class="game-type-icon">📊</div>
                   <h4>Full Stats</h4>
                   <p>Rosters & player stats</p>
                 </div>
@@ -1550,6 +2277,7 @@
             </div>
           </div>
         </div>
+
         <div class="card">
           <div class="card__body">
             <h4>Teams</h4>
@@ -1563,25 +2291,30 @@
                 <input id="teamBName" class="form-control" placeholder="Team B"/>
               </div>
             </div>
+
             <div class="form-row color-picker-group">
               <div class="form-group">
                 <label class="form-label" for="teamAColor">Team A Color</label>
                 <input id="teamAColor" class="form-control color-input" type="color" value="#FF6B35"/>
               </div>
+              <div class="color-preview" id="teamAColorPreview"></div>
+
               <div class="form-group">
                 <label class="form-label" for="teamBColor">Team B Color</label>
                 <input id="teamBColor" class="form-control color-input" type="color" value="#1B263B"/>
               </div>
+              <div class="color-preview" id="teamBColorPreview"></div>
             </div>
           </div>
         </div>
       </div>
+
       <div class="section-actions">
         <button id="proceedToSetup" class="btn btn--primary">Continue</button>
       </div>
     </section>
 
-    <!-- Setup View - The page for adding players to rosters (if 'Full Stats' was selected). -->
+    <!-- Setup View -->
     <section id="setup-view" class="view container hidden">
       <div class="section-header">
         <div>
@@ -1598,6 +2331,7 @@
           <button id="startGame" class="btn btn--primary">Start Game</button>
         </div>
       </div>
+
       <div class="setup-grid">
         <div class="card team-setup-card">
           <div class="card__body">
@@ -1605,18 +2339,27 @@
             <div class="form-row">
               <input id="teamAPlayerNumber" class="form-control" type="number" min="0" max="99" placeholder="Jersey #"/>
               <input id="teamAPlayerName" class="form-control" placeholder="Name"/>
+              <select id="teamAPlayerPosition" class="form-control">
+                <option value="">Position</option>
+                <option>G</option><option>F</option><option>C</option>
+              </select>
               <button id="addTeamAPlayer" class="btn btn--secondary">Add</button>
             </div>
             <div id="teamARoster" class="roster-list"></div>
             <div class="roster-counter">Players: <span id="teamACount">0</span></div>
           </div>
         </div>
+
         <div class="card team-setup-card">
           <div class="card__body">
             <h3 id="teamBSetupTitle">Team B</h3>
             <div class="form-row">
               <input id="teamBPlayerNumber" class="form-control" type="number" min="0" max="99" placeholder="Jersey #"/>
               <input id="teamBPlayerName" class="form-control" placeholder="Name"/>
+              <select id="teamBPlayerPosition" class="form-control">
+                <option value="">Position</option>
+                <option>G</option><option>F</option><option>C</option>
+              </select>
               <button id="addTeamBPlayer" class="btn btn--secondary">Add</button>
             </div>
             <div id="teamBRoster" class="roster-list"></div>
@@ -1626,7 +2369,7 @@
       </div>
     </section>
 
-    <!-- Control View - The main control panel for scoring and managing the game. -->
+    <!-- Control View -->
     <section id="control-view" class="view container hidden">
       <div class="control-header">
         <div>
@@ -1648,6 +2391,7 @@
         <div class="team-score" id="teamACol">
           <h3 id="teamANameHdr">Team A</h3>
           <div class="score-display" id="teamAScore">0</div>
+          <div id="teamATopScorer" class="top-scorer">No scorer yet</div>
           <div class="score-controls">
             <button class="btn score-btn" id="teamAPlus1">+1</button>
             <button class="btn score-btn" id="teamAPlus2">+2</button>
@@ -1655,6 +2399,7 @@
             <button class="btn score-btn" id="teamAMinus1">-1</button>
           </div>
         </div>
+
         <div class="clock-section">
           <div class="period-display">Period: <span id="periodDisplay">1</span></div>
           <div class="clock-display" id="clockDisplay">12:00</div>
@@ -1665,6 +2410,7 @@
               <button id="prevPeriodBtn" class="btn btn--secondary">Prev Period</button>
             </div>
           </div>
+
           <div class="shot-clock-section" id="shotClockSection">
             <div class="shot-clock-display" id="shotClockDisplay">24</div>
             <div class="shot-clock-label">Shot Clock</div>
@@ -1675,14 +2421,17 @@
               <button id="editShotClockBtn" class="btn btn--outline">Edit Shot</button>
             </div>
           </div>
+
           <div class="possession-controls">
             <button id="possessionTeamA" class="btn btn--secondary">Possession: Team A</button>
             <button id="possessionTeamB" class="btn btn--secondary">Possession: Team B</button>
           </div>
         </div>
+
         <div class="team-score" id="teamBCol">
           <h3 id="teamBNameHdr">Team B</h3>
           <div class="score-display" id="teamBScore">0</div>
+          <div id="teamBTopScorer" class="top-scorer">No scorer yet</div>
           <div class="score-controls">
             <button class="btn score-btn" id="teamBPlus1">+1</button>
             <button class="btn score-btn" id="teamBPlus2">+2</button>
@@ -1691,8 +2440,9 @@
           </div>
         </div>
       </div>
-      <!-- Stats section for 'Full Stats' games -->
-      <section id="statsSection" class="stats-section hidden">
+
+      <!-- Stats (visible when gameType=full) -->
+      <section id="statsSection" class="stats-section">
         <div class="stats-header">
           <h3>Player Scoring</h3>
           <div class="stats-controls">
@@ -1703,26 +2453,49 @@
           </div>
         </div>
         <div class="player-scoring-grid" id="playerScoringGrid"></div>
+
+        <div class="comprehensive-stats-section">
+          <h5>Box Score</h5>
+          <div class="stats-table-container">
+            <table class="comprehensive-stats-table" id="statsTable">
+              <thead>
+                <tr>
+                  <th class="sticky-col">#</th>
+                  <th class="sticky-col">Player</th>
+                  <th>PTS</th><th>FT</th><th>FG</th><th>3PT</th>
+                  <th>OREB</th><th>DREB</th><th>AST</th><th>STL</th>
+                  <th>BLK</th><th>TOV</th><th>FLS</th>
+                </tr>
+              </thead>
+              <tbody id="statsTableBody"></tbody>
+            </table>
+          </div>
+        </div>
       </section>
     </section>
 
-    <!-- Viewer View - A minimal, large-display view for spectators and referees. -->
+    <!-- Viewer View -->
     <section id="viewer-view" class="view container hidden">
       <div class="viewer-scoreboard">
         <div class="viewer-team">
           <h2 id="viewerTeamAName">Team A</h2>
           <div class="viewer-score" id="viewerTeamAScore">0</div>
+          <div id="viewerTeamATopScorer" class="viewer-top-scorer">No scorer yet</div>
         </div>
+
         <div class="viewer-center">
           <div class="viewer-clock" id="viewerClock">12:00</div>
           <div class="viewer-period">Period: <span id="viewerPeriod">1</span></div>
           <div class="viewer-shot-clock" id="viewerShotClock">24</div>
         </div>
+
         <div class="viewer-team">
           <h2 id="viewerTeamBName">Team B</h2>
           <div class="viewer-score" id="viewerTeamBScore">0</div>
+          <div id="viewerTeamBTopScorer" class="viewer-top-scorer">No scorer yet</div>
         </div>
       </div>
+
       <div class="viewer-info">
         <div class="game-name" id="viewerGameName">Basketball Game</div>
         <div class="possession-indicator" id="viewerPossession">Possession: Team A</div>
@@ -1767,5 +2540,250 @@
 
   <!-- Toasts -->
   <div id="toastContainer" class="toast-container"></div>
+
+  <script>
+    // All JavaScript from app.js is now embedded here
+    // ================== GLOBAL STATE ==================
+    const appState = {
+      view: 'landing',
+      isHost: false,
+      gameCode: null,
+      game: null, // Will be populated for the preview
+      gameType: 'friendly',
+      timers: { masterTimer: null },
+      broadcastChannel: null,
+      gameRunning: false,
+      shotClockRunning: false,
+      selectedPlayer: null,
+      actionHistory: [],
+      clockEditing: false
+    };
+
+    // ================== SHORTCUTS ==================
+    const $ = (id) => document.getElementById(id);
+    const $$ = (sel) => document.querySelectorAll(sel);
+
+    // ================== HELPERS ==================
+    function generateGameCode() {
+      return Math.floor(100000 + Math.random() * 900000).toString();
+    }
+    function pad2(n) { return n.toString().padStart(2, '0'); }
+    function formatTime(m, s) { return `${pad2(m)}:${pad2(s)}`; }
+    function toast(message, type = 'info', duration = 2000) {
+      const c = $('toastContainer');
+      if (!c) return;
+      const el = document.createElement('div');
+      const size = message.length > 50 || type === 'error' ? 'large' :
+                  message.length > 30 || type === 'warning' ? 'medium' : 'small';
+      el.className = `toast ${type} ${size}`;
+      el.textContent = message;
+      c.appendChild(el);
+      setTimeout(() => {
+        el.style.opacity = '0';
+        el.style.transform = 'translateX(100%)';
+        setTimeout(() => el.remove(), 300);
+      }, duration);
+    }
+    async function copyToClipboard(text) {
+      try {
+        if (navigator.clipboard && window.isSecureContext) {
+          await navigator.clipboard.writeText(text);
+          toast('Game code copied!', 'success', 1500);
+          return;
+        }
+      } catch {}
+      const ta = document.createElement('textarea');
+      ta.value = text;
+      ta.style.position = 'fixed';
+      ta.style.left = '-9999px';
+      document.body.appendChild(ta);
+      ta.select();
+      try {
+        document.execCommand('copy');
+        toast('Game code copied!', 'success', 1500);
+      } catch {
+        toast('Copy failed - copy manually', 'warning', 3000);
+      }
+      ta.remove();
+    }
+
+    // ================== SCORE ANIMATION & UPDATE LOGIC ==================
+    function triggerAnimation(elementId, animationClass) {
+      const element = $(elementId);
+      if (element) {
+        element.classList.add(animationClass);
+        element.addEventListener('animationend', () => {
+          element.classList.remove(animationClass);
+        }, { once: true });
+      }
+    }
+
+    function updateScore(team, points) {
+      if (!appState.game) return;
+      const gameState = appState.game.gameState;
+      const scoreElementId = team === 'teamA' ? 'teamAScore' : 'teamBScore';
+      const viewerScoreElementId = team === 'teamA' ? 'viewerTeamAScore' : 'viewerTeamBScore';
+      gameState.scores[team] += points;
+      if (gameState.scores[team] < 0) {
+        gameState.scores[team] = 0;
+      }
+      triggerAnimation(scoreElementId, 'score-update-animation');
+      triggerAnimation(viewerScoreElementId, 'score-update-animation');
+      updateControlDisplay();
+      updateSpectatorView();
+    }
+
+    // ================== VIEW ROUTER ==================
+    function showView(view) {
+      const ids = ['landing', 'config', 'setup', 'control', 'viewer'];
+      ids.forEach(v => {
+        const el = $(`${v}-view`);
+        if (!el) return;
+        if (v === view) {
+          el.classList.remove('hidden');
+          el.style.display = 'block'; 
+        } else {
+          el.classList.add('hidden');
+          el.style.display = 'none';
+        }
+      });
+      appState.view = view;
+    }
+
+    // ================== DUMMY/MOCK FUNCTIONS FOR PREVIEW ==================
+    function updateControlDisplay() {
+        if (!appState.game) return;
+        $('teamAScore').textContent = appState.game.gameState.scores.teamA;
+        $('teamBScore').textContent = appState.game.gameState.scores.teamB;
+        $('clockDisplay').textContent = formatTime(appState.game.gameState.gameTime.minutes, appState.game.gameState.gameTime.seconds);
+        $('shotClockDisplay').textContent = appState.game.gameState.shotClock;
+    }
+
+    function updateSpectatorView() {
+        if (!appState.game) return;
+        $('viewerTeamAScore').textContent = appState.game.gameState.scores.teamA;
+        $('viewerTeamBScore').textContent = appState.game.gameState.scores.teamB;
+        $('viewerClock').textContent = formatTime(appState.game.gameState.gameTime.minutes, appState.game.gameState.gameTime.seconds);
+        $('viewerShotClock').textContent = appState.game.gameState.shotClock;
+    }
+    
+    // ================== MASTER TIMER AND CLOCK CONTROLS (Adapted for Preview) ==================
+    function startMasterTimer() {
+        stopMasterTimer(); // Prevent multiple intervals
+        appState.timers.masterTimer = setInterval(() => {
+            const g = appState.game;
+            if (!g) return;
+            let changed = false;
+
+            if (appState.gameRunning) {
+                const t = g.gameState.gameTime;
+                if (t.seconds > 0) {
+                    t.seconds--; changed = true;
+                } else if (t.minutes > 0) {
+                    t.minutes--; t.seconds = 59; changed = true;
+                } else {
+                    appState.gameRunning = false;
+                }
+            }
+
+            if (appState.shotClockRunning) {
+                if (g.gameState.shotClock > 0) {
+                    g.gameState.shotClock--; changed = true;
+                } else {
+                    appState.shotClockRunning = false;
+                }
+            }
+
+            if (changed) {
+                updateControlDisplay();
+                updateSpectatorView();
+            }
+
+            if (!appState.gameRunning && !appState.shotClockRunning) {
+                stopMasterTimer();
+            }
+        }, 1000);
+    }
+
+    function stopMasterTimer() {
+        if (appState.timers.masterTimer) {
+            clearInterval(appState.timers.masterTimer);
+            appState.timers.masterTimer = null;
+        }
+    }
+
+    function toggleShotClock() {
+        if (!appState.game || appState.game.settings.shotClockDuration <= 0) return;
+        appState.shotClockRunning = !appState.shotClockRunning;
+        if (appState.shotClockRunning) {
+            startMasterTimer(); 
+            toast('Shot clock started', 'info', 1500);
+        } else {
+            toast('Shot clock paused', 'info', 1500);
+        }
+    }
+
+    // ================== INITIALIZATION FOR PREVIEW (FIXED) ==================
+    function initializePreview() {
+      // Create a dummy game state
+      appState.game = {
+        settings: {
+          gameName: "Live Preview",
+          teamAName: "Home",
+          teamBName: "Away",
+          periodDuration: 12,
+          shotClockDuration: 24,
+        },
+        gameState: {
+          scores: { teamA: 0, teamB: 0 },
+          gameTime: { minutes: 12, seconds: 0 },
+          shotClock: 24,
+          period: 1,
+          possession: 'teamA'
+        },
+        rosters: { teamA: [], teamB: [] }
+      };
+      
+      // Manually set the view state for the preview
+      appState.view = 'control'; // Set the logical state
+      $('landing-view').style.display = 'none'; // Hide landing page
+      $('control-view').style.display = 'block'; // Show control panel
+      $('viewer-view').style.display = 'block'; // Show viewer panel
+      $('control-view').classList.remove('hidden');
+      $('viewer-view').classList.remove('hidden');
+
+      // Set team names
+      $('teamANameHdr').textContent = appState.game.settings.teamAName;
+      $('teamBNameHdr').textContent = appState.game.settings.teamBName;
+      $('viewerTeamAName').textContent = appState.game.settings.teamAName;
+      $('viewerTeamBName').textContent = appState.game.settings.teamBName;
+
+      // Update displays with initial state
+      updateControlDisplay();
+      updateSpectatorView();
+
+      // Attach score button listeners
+      $('teamAPlus1').addEventListener('click', () => updateScore('teamA', 1));
+      $('teamAPlus2').addEventListener('click', () => updateScore('teamA', 2));
+      $('teamAPlus3').addEventListener('click', () => updateScore('teamA', 3));
+      $('teamAMinus1').addEventListener('click', () => updateScore('teamA', -1));
+      $('teamBPlus1').addEventListener('click', () => updateScore('teamB', 1));
+      $('teamBPlus2').addEventListener('click', () => updateScore('teamB', 2));
+      $('teamBPlus3').addEventListener('click', () => updateScore('teamB', 3));
+      $('teamBMinus1').addEventListener('click', () => updateScore('teamB', -1));
+
+      // Attach keyboard listener for the spacebar
+      document.addEventListener('keydown', (event) => {
+          if (appState.view !== 'control') return;
+          if (event.code === 'Space') {
+              event.preventDefault(); 
+              toggleShotClock();
+          }
+      });
+    }
+
+    document.addEventListener('DOMContentLoaded', initializePreview);
+
+  </script>
 </body>
 </html>
